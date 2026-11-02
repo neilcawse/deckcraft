@@ -492,6 +492,8 @@ impl SlideApp {
                 Ok(_) => self.set_status("Saved"),
                 Err(e) => self.set_status(e.to_string()),
             }
+        } else if self.services.pick_save.is_none() && self.services.download.is_some() {
+            self.save_as_dialog("pptx");
         } else {
             self.save_as_dialog("deckcraft");
         }
@@ -511,7 +513,8 @@ impl SlideApp {
                 UiRequest::Message { text } => self.set_status(text),
                 UiRequest::PickFile { purpose } => {
                     if purpose == "saveAs" {
-                        self.save_as_dialog("deckcraft");
+                        let fmt = if self.services.pick_save.is_none() && self.services.download.is_some() { "pptx" } else { "deckcraft" };
+                        self.save_as_dialog(fmt);
                     }
                 }
                 UiRequest::Media { action, shape, ms } => {

@@ -30,6 +30,8 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
+        let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
+        let app_bridge = bridge.clone();
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -44,9 +46,13 @@ pub fn start() {
                         return Ok(Box::new(presenter) as Box<dyn eframe::App>);
                     }
                     let inbox: Inbox = Inbox::default();
-                    let mut app = SlideApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
+                    let mut svc = services(inbox.clone(), cc.egui_ctx.clone());
+                    if let Some(bridge) = &app_bridge {
+                        bridge.connect(&mut svc, cc.egui_ctx.clone());
+                    }
+                    let mut app = SlideApp::new(Session::new(), svc);
                     let q = query();
-                    if !q.contains("blank") {
+                    if app_bridge.is_none() && !q.contains("blank") {
                         if let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session) {
                             log::error!("sample deck: {e}");
                         }
@@ -56,10 +62,19 @@ pub fn start() {
                     if q.contains("show") {
                         app.start_show(0, false);
                     }
-                    Ok(Box::new(WebShell { app, inbox }))
+                    if let Some(bridge) = &app_bridge {
+                        if let Some(author) = query_param("author") {
+                            crate::host::Bridge::set_author(&mut app, &author);
+                        }
+                        bridge.post_ready();
+                    }
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge }))
                 }),
             )
             .await;
+        if let (Err(e), Some(bridge)) = (&result, &bridge) {
+            bridge.post_failed(&format!("{e:?}"));
+        }
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
                 Ok(()) => el.remove(),
@@ -72,17 +87,24 @@ pub fn start() {
 fn query() -> String {
     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
 }
+fn query_param(key: &str) -> Option<String> {
+    web_sys::UrlSearchParams::new_with_str(&query()).ok()?.get(key)
+}
 
 /// Wraps the app to read dropped files asynchronously (browsers can't read them synchronously)
 /// and feed them through the inbox.
 struct WebShell {
     app: SlideApp,
     inbox: Inbox,
+    bridge: Option<crate::host::Bridge>,
 }
 
 impl eframe::App for WebShell {
     /// Delegate one eframe logic pass to the wrapped application.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(bridge) = &self.bridge {
+            bridge.drain_opens(&mut self.app);
+        }
         self.app.logic(ctx);
         if self.app.show.is_none()
             && let Some(host) = self.app.services.presenter.as_mut()
@@ -90,7 +112,6 @@ impl eframe::App for WebShell {
             host.close();
         }
     }
-
     /// Consume browser drops with fresh input, capture the identity before the asynchronous read,
     /// and deliver the id, name, and bytes through the inbox.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -120,6 +141,9 @@ impl eframe::App for WebShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        if let Some(bridge) = &self.bridge {
+            bridge.sync(&mut self.app);
+        }
     }
 }
 
