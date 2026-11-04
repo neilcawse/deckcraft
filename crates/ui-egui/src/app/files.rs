@@ -218,7 +218,7 @@ impl SlideApp {
                 Err(_) => false,
             };
         }
-        let Some(doc) = self.session.active().map(|d| d.doc.clone()) else { return false };
+        let Some((uid, doc)) = self.session.active().map(|d| (d.uid, d.doc.clone())) else { return false };
         let bytes = match format {
             "png" | "jpeg" => {
                 // Every slide for "all slides", one download each, named like the desktop export (#64).
@@ -226,7 +226,7 @@ impl SlideApp {
                 let mut any = false;
                 let transparent = extra.get("transparentBackground").and_then(Value::as_bool).unwrap_or(false);
                 for (file, bytes) in web_image_files(&doc, slide, all, &name, ext, transparent) {
-                    any = self.download(&file, Ok(bytes)) || any;
+                    any = self.hand_over(&file, Ok(bytes), uid, true, None) || any;
                 }
                 return any;
             }
@@ -234,22 +234,44 @@ impl SlideApp {
             "gif" => deckcraft_engine::cmd::file::gif_bytes(&doc, &extra),
             other => deckcraft_engine::cmd::file::save_bytes(&doc, other),
         };
-        self.download(&suggested, bytes)
+        self.hand_over(&suggested, bytes, uid, true, None)
     }
 
-    /// Hands `bytes` to the browser as a download (web); false (with the reason in the status
-    /// bar) when there are no bytes or no way to download.
-    fn download(&mut self, name: &str, bytes: deckcraft_engine::Result<Vec<u8>>) -> bool {
-        match (bytes, self.services.download.as_mut()) {
-            (Ok(b), Some(dl)) => {
-                dl(name, &b);
+    /// Hands a file made from presentation `document` (its uid) to the user (web): to the host
+    /// page ([`crate::Services::host_save`]) when there is one, else as a browser download.
+    /// `save_as` is whether the command asked for a new file; `saved` the presentation's content
+    /// for a Save or Save As of it. False (with the reason in the status bar) when there are no
+    /// bytes, no way to hand them over, or the page didn't get them.
+    fn hand_over(
+        &mut self,
+        name: &str,
+        bytes: deckcraft_engine::Result<Vec<u8>>,
+        document: u64,
+        save_as: bool,
+        saved: Option<std::sync::Arc<deckcraft_engine::model::Presentation>>,
+    ) -> bool {
+        let bytes = match bytes {
+            Ok(b) => b,
+            Err(e) => {
+                self.set_status(e.to_string());
+                return false;
+            }
+        };
+        if let Some(host) = self.services.host_save.as_mut() {
+            return match host(&crate::HostSave { name, bytes: &bytes, save_as, document, saved }) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.set_status(format!("Couldn't save {name}: {e}"));
+                    false
+                }
+            };
+        }
+        match self.services.download.as_mut() {
+            Some(dl) => {
+                dl(name, &bytes);
                 true
             }
-            (Err(e), _) => {
-                self.set_status(e.to_string());
-                false
-            }
-            (Ok(_), None) => {
+            None => {
                 self.set_status("Saving a copy needs a file picker, which this window doesn't have.");
                 false
             }
@@ -260,12 +282,12 @@ impl SlideApp {
     /// layout, slides and options) is written to the temporary folder and opened in the system's
     /// PDF viewer, which has the printers; on the web it downloads.
     pub fn print_pdf(&mut self, params: Value) -> bool {
-        let Some((title, doc)) = self.session.active().map(|d| (d.title(), d.doc.clone())) else { return false };
+        let Some((title, uid, doc)) = self.session.active().map(|d| (d.title(), d.uid, d.doc.clone())) else { return false };
         let mut params = if params.is_object() { params } else { json!({}) };
         if self.services.pick_save.is_none() {
             // Web: the browser hands the PDF to the user.
             let bytes = deckcraft_engine::cmd::file::pdf_bytes(&doc, &params);
-            return self.download(&format!("{title}.pdf"), bytes);
+            return self.hand_over(&format!("{title}.pdf"), bytes, uid, true, None);
         }
         let preview_path = match self.print_previews.create(&title) {
             Ok(path) => path,
@@ -447,29 +469,55 @@ impl SlideApp {
         }
     }
 
+    /// File › Save As in `format` (`pptx`, else `.deckcraft`): the system Save dialog on the
+    /// desktop; on the web the file goes to the host page or downloads.
     pub fn save_as_dialog(&mut self, format: &str) {
+        self.save_presentation(format, true);
+    }
+
+    /// Save the active presentation in `format` to a file the user picks (desktop), or hand it to
+    /// the host page or the browser (web). `save_as` is whether the command asked for a new file
+    /// (Save As) rather than Save of a presentation without one. On the web a page that keeps the
+    /// files and doesn't confirm them has saved the presentation once it has the file. Returns
+    /// whether the file was written or handed over.
+    fn save_presentation(&mut self, format: &str, save_as: bool) -> bool {
         let name = self.session.active().map(|d| d.title()).unwrap_or_else(|| "Presentation".into());
         let ext = if format == "pptx" { "pptx" } else { "deckcraft" };
         let suggested = format!("{name}.{ext}");
         if let Some(pick) = self.services.pick_save.as_mut() {
-            if let Some(path) = pick(&suggested) {
-                match self.session.execute("file.saveAs", &json!({"path": path})) {
-                    Ok(_) => {
-                        self.set_status(format!("Saved {path}"));
-                        self.ui.recent.retain(|p| *p != path);
-                        self.ui.recent.insert(0, path);
-                    }
-                    Err(e) => self.set_status(e.to_string()),
+            let Some(path) = pick(&suggested) else { return false };
+            return match self.session.execute("file.saveAs", &json!({"path": path})) {
+                Ok(_) => {
+                    self.set_status(format!("Saved {path}"));
+                    self.ui.recent.retain(|p| *p != path);
+                    self.ui.recent.insert(0, path);
+                    true
                 }
-            }
-        } else if let Some(dl) = self.services.download.as_mut()
-            && let Some(d) = self.session.active()
-        {
-            match deckcraft_engine::cmd::file::save_bytes(&d.doc, ext) {
-                Ok(bytes) => dl(&suggested, &bytes),
-                Err(e) => self.set_status(e.to_string()),
-            }
+                Err(e) => {
+                    self.set_status(e.to_string());
+                    false
+                }
+            };
         }
+        if self.services.download.is_none() && self.services.host_save.is_none() {
+            return false;
+        }
+        let Some((uid, doc)) = self.session.active().map(|d| (d.uid, d.doc.clone())) else { return false };
+        let bytes = deckcraft_engine::cmd::file::save_bytes(&doc, ext);
+        let handed = self.hand_over(&suggested, bytes, uid, save_as, Some(doc.clone()));
+        if handed
+            && self.services.host_save.is_some()
+            && !self.services.host_confirms_saves
+            && let Some(d) = self.session.document_mut(uid)
+        {
+            d.saved_doc = doc;
+        }
+        handed
+    }
+
+    /// Saves go to the browser (a download or the host page) rather than a picked path.
+    pub(crate) fn web_saves(&self) -> bool {
+        self.services.pick_save.is_none() && (self.services.download.is_some() || self.services.host_save.is_some())
     }
 
     /// Save every presentation with unsaved changes (asking for a location where needed).
@@ -486,16 +534,25 @@ impl SlideApp {
         true
     }
 
-    pub fn save(&mut self) {
+    /// File › Save of the active presentation: to its file, else as Save As would (the system
+    /// Save dialog on the desktop; on the web, a `.pptx` to the host page or the browser, as a
+    /// Save, not a Save As). Returns whether the file was written or handed over.
+    pub fn save(&mut self) -> bool {
         if self.session.active().and_then(|d| d.path.clone()).is_some() {
             match self.session.execute("file.save", &json!({})) {
-                Ok(_) => self.set_status("Saved"),
-                Err(e) => self.set_status(e.to_string()),
+                Ok(_) => {
+                    self.set_status("Saved");
+                    true
+                }
+                Err(e) => {
+                    self.set_status(e.to_string());
+                    false
+                }
             }
-        } else if self.services.pick_save.is_none() && self.services.download.is_some() {
-            self.save_as_dialog("pptx");
+        } else if self.web_saves() {
+            self.save_presentation("pptx", false)
         } else {
-            self.save_as_dialog("deckcraft");
+            self.save_presentation("deckcraft", true)
         }
     }
 
@@ -512,9 +569,15 @@ impl SlideApp {
                 UiRequest::StartShow { from } => self.start_show(from, false),
                 UiRequest::Message { text } => self.set_status(text),
                 UiRequest::PickFile { purpose } => {
-                    if purpose == "saveAs" {
-                        let fmt = if self.services.pick_save.is_none() && self.services.download.is_some() { "pptx" } else { "deckcraft" };
-                        self.save_as_dialog(fmt);
+                    let fmt = if self.web_saves() { "pptx" } else { "deckcraft" };
+                    match purpose.as_str() {
+                        "save" => {
+                            self.save_presentation(fmt, false);
+                        }
+                        "saveAs" => {
+                            self.save_presentation(fmt, true);
+                        }
+                        _ => {}
                     }
                 }
                 UiRequest::Media { action, shape, ms } => {
@@ -537,7 +600,9 @@ impl SlideApp {
         for event in events {
             match event {
                 InboxEvent::Cancelled { id } => self.pending_files.retain(|r| r.id != id),
-                InboxEvent::File(file) => self.apply_external_file(file.id, &file.name, &file.bytes),
+                InboxEvent::File(file) => {
+                    self.apply_external_file(file.id, &file.name, &file.bytes);
+                }
             }
         }
     }
@@ -554,10 +619,11 @@ impl SlideApp {
     }
 
     /// A dropped or picked file read synchronously: presentations open, media is inserted on
-    /// the slide that is current now.
-    pub fn open_or_insert_bytes(&mut self, name: &str, bytes: &[u8]) {
+    /// the slide that is current now. Returns the presentation the file opened as, `None` when
+    /// it didn't open as one (refused, unreadable, or inserted into the open presentation).
+    pub fn open_or_insert_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<crate::OpenedFile> {
         let id = self.begin_external_file("drop");
-        self.apply_external_file(id, name, bytes);
+        self.apply_external_file(id, name, bytes)
     }
 
     fn capture_file_target(&self) -> FileTarget {
@@ -604,14 +670,15 @@ impl SlideApp {
         }
     }
 
-    fn apply_external_file(&mut self, id: u64, name: &str, bytes: &[u8]) {
-        let Some(pos) = self.pending_files.iter().position(|r| r.id == id) else { return };
+    /// Apply the file requested as `id`; returns the presentation it opened as, if it opened one.
+    fn apply_external_file(&mut self, id: u64, name: &str, bytes: &[u8]) -> Option<crate::OpenedFile> {
+        let pos = self.pending_files.iter().position(|r| r.id == id)?;
         let req = self.pending_files.remove(pos);
         let cmd = match command_for(req.purpose, name, bytes) {
             Ok(cmd) => cmd,
             Err(e) => {
                 self.set_status(e);
-                return;
+                return None;
             }
         };
         let params = if cmd == "slide.fromOutline" {
@@ -619,7 +686,12 @@ impl SlideApp {
         } else {
             json!({"name": name, "data": deckcraft_engine::cmd::base64_encode(bytes)})
         };
-        let result = if cmd == "file.openBytes" || self.viewing_target(&req.target) {
+        let mut opened = None;
+        let result = if cmd == "file.openBytes" {
+            self.session.execute(cmd, &params).map_err(|e| e.to_string()).map(|v| {
+                opened = v["uid"].as_u64().map(|document| crate::OpenedFile { document, in_place: v["inPlace"].as_bool() == Some(true) });
+            })
+        } else if self.viewing_target(&req.target) {
             self.session.execute(cmd, &params).map(|_| ()).map_err(|e| e.to_string())
         } else {
             self.execute_on_target(&req.target, name, cmd, &params)
@@ -630,6 +702,7 @@ impl SlideApp {
             Ok(()) => {}
         }
         self.drain_requests();
+        opened
     }
 
     /// Run `cmd` on the document and slide captured for the request, then put the view back

@@ -250,6 +250,8 @@ fn size_tab(app: &mut SlideApp, ui: &mut Ui, sh: &deckcraft_model::Shape, x: dec
     let r = ui.add(egui::TextEdit::multiline(&mut alt).hint_text("Alt text").desired_rows(3).desired_width(f32::INFINITY));
     if r.lost_focus() && alt != sh.descr {
         run(app, "shape.altText", json!({"text": alt}));
+    } else {
+        app.drafting |= alt != sh.descr;
     }
     ui.data_mut(|d| d.insert_temp(id, (sh.descr.clone(), alt)));
 }

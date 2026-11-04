@@ -206,7 +206,9 @@ impl SlideApp {
         for f in std::mem::take(&mut raw.dropped_files) {
             let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped file".into());
             match f.bytes() {
-                Ok(bytes) => self.open_or_insert_bytes(&name, &bytes),
+                Ok(bytes) => {
+                    self.open_or_insert_bytes(&name, &bytes);
+                }
                 Err(e) => self.set_status(e),
             }
         }

@@ -3181,6 +3181,8 @@ fn damaged_native_file_opens_as_repaired_copy() {
         // Bytes route too.
         let r = s.execute("file.openBytes", &json!({"name": name, "data": crate::cmd::base64_encode(bytes)})).unwrap();
         assert_eq!(r["damagedMedia"].as_array().map(|a| a.len()), Some(usize::from(damaged)));
+        assert_eq!(r["inPlace"], json!(!damaged), "a repaired copy must not be saved over {name}");
+        assert_eq!(r["uid"].as_u64(), s.doc().ok().map(|d| d.uid));
     }
     assert_eq!(std::fs::read(dir.join("bad.deckcraft")).unwrap(), bad, "original untouched");
     let _ = std::fs::remove_dir_all(&dir);
@@ -5333,6 +5335,7 @@ fn opening_a_pptx_with_an_unreadable_slide_says_so() {
     let mut t = session();
     let r = t.execute("file.openBytes", &json!({"name": "Broken.pptx", "data": cmd::base64_encode(&broken)})).unwrap();
     assert_eq!(r["lostSlides"], json!(["ppt/slides/slide2.xml"]), "{r}");
+    assert_eq!(r["inPlace"], json!(false), "the repaired copy must not be saved over Broken.pptx");
     assert_eq!(t.doc().unwrap().doc.slides.len(), 1);
     assert!(t.doc().unwrap().title.ends_with("(Repaired)"), "{}", t.doc().unwrap().title);
     assert!(t.ui_requests.iter().any(|u| matches!(u, crate::UiRequest::Message { text } if text.contains("1 slide in this file couldn't be read"))));
@@ -5340,6 +5343,7 @@ fn opening_a_pptx_with_an_unreadable_slide_says_so() {
     let mut u = session();
     let r = u.execute("file.openBytes", &json!({"name": "Fine.pptx", "data": cmd::base64_encode(&good)})).unwrap();
     assert_eq!(r["lostSlides"], json!([]), "{r}");
+    assert_eq!(r["inPlace"], json!(true));
     assert!(u.ui_requests.is_empty());
 }
 

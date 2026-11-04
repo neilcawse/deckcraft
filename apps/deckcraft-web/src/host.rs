@@ -4,18 +4,27 @@
 //! - `deckcraft:ready` (to the parent): `{ version }`, the app is listening; send a file now.
 //! - `deckcraft:open` (from the parent): `{ name, bytes }`, bytes an `ArrayBuffer` or
 //!   `Uint8Array`. It opens like a presentation picked with File › Open or dropped on the window.
-//! - `deckcraft:opened` (to the parent): `{ name, docId }` once a sent file has opened: `docId`
-//!   is the presentation it became, or `null` when it didn't open.
-//! - `deckcraft:save` (to the parent): `{ name, bytes, docId, saveId }` (`bytes` a transferred
-//!   `ArrayBuffer`) for every file DeckCraft would otherwise download: Save and Save As
-//!   (.pptx / .deckcraft) and Export. `docId` is the presentation it came from (`null` when none
-//!   is open), the same number `deckcraft:opened` gave for a sent file, so the parent writes it
-//!   back only to that file. `saveId` numbers the saves. The parent stores it and reports
-//!   failures itself.
+//! - `deckcraft:opened` (to the parent): `{ name, docId }` once a sent file has been opened:
+//!   `docId` is the presentation it became, or `null` when it must not be written over the sent
+//!   file: it didn't open, went into the open presentation (an outline), or opened as a repaired
+//!   copy of a damaged file.
+//! - `deckcraft:save` (to the parent): `{ name, bytes, docId, saveId, saveAs }` (`bytes` a
+//!   transferred `ArrayBuffer`) for every file DeckCraft would otherwise download: Save and Save
+//!   As (.pptx / .deckcraft), Export and Print. `docId` is the presentation the bytes were made
+//!   from, the same number `deckcraft:opened` gave for a sent file, so the parent writes it back
+//!   only to that file. `saveAs` is true when the command asked for a new file (Save As, Export,
+//!   Print), false for Save. A file the control channel writes by path has `docId: null` and
+//!   `saveAs: true`: it is never a presentation's file. `saveId` numbers the saves. The parent
+//!   stores it and reports failures itself.
 //! - `deckcraft:saved` (from the parent, with `?ack=1`): `{ saveId, name }`, the save is stored
-//!   as `name`. Only then does the presentation count as saved, as it was when it was saved.
+//!   as `name`. Only then does the presentation count as saved, as it was when it was saved; a
+//!   Save Changes prompt's Save leaves the presentation open until then.
 //!   Without `?ack=1` a presentation counts as saved once it is handed over.
-//! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
+//! - `deckcraft:discard` (from the parent, with `?ack=1`): `{ saveId }`, the parent will never
+//!   store that save (the picker was dismissed, the write failed, a newer save replaced it); the
+//!   presentation stays unsaved.
+//! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved work appears or goes away:
+//!   a presentation with unsaved changes, or typing not yet in one (notes, a comment…).
 //! - `deckcraft:request-save` (from the parent): save the active presentation as File › Save
 //!   would, so a parent's own Save button or shortcut gets a `deckcraft:save` back.
 //! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start.
@@ -26,26 +35,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use deckcraft_engine::model::Presentation;
-use deckcraft_ui_egui::{Services, SlideApp};
+use deckcraft_ui_egui::{HostSave, Services, SlideApp};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 
-/// Saving one of these hands the whole presentation to the parent, which stores it: the
-/// presentation counts as saved under that name, as it would after Save on the desktop.
-const PRESENTATION_EXTS: &[&str] = &["pptx", "potx", "ppsx", "deckcraft"];
+use crate::unacked::{Pending, Unacked};
+
 const MAX_AUTHOR_CHARS: usize = 200;
-
-/// Files by name: `(name, bytes)`.
-type Files = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
-
-/// A presentation handed to the parent and not yet acknowledged: the presentation it came from
-/// and its content then.
-struct Unacked {
-    save_id: u64,
-    doc: u64,
-    content: Arc<Presentation>,
-}
 
 #[derive(Clone)]
 pub struct Bridge {
@@ -55,20 +52,15 @@ pub struct Bridge {
     /// `?ack=1`: a presentation counts as saved when the parent says it stored it
     /// (`deckcraft:saved`), not when it is handed over.
     ack: bool,
-    /// Files DeckCraft saved since the last frame, posted after it with the presentation they
-    /// came from.
-    saves: Files,
     /// Files the parent sent that the app hasn't been given yet.
     sent: Rc<RefCell<VecDeque<(String, Vec<u8>)>>>,
-    /// The sent file the app was given last frame, and the presentations open before it.
-    opening: Rc<RefCell<Option<(String, Vec<u64>)>>>,
     /// Saves the parent stored since the last frame: `(saveId, name)`.
     stored: Rc<RefCell<Vec<(u64, String)>>>,
-    unacked: Rc<RefCell<Vec<Unacked>>>,
+    unacked: Rc<RefCell<Pending<Arc<Presentation>>>>,
     next_save_id: Rc<Cell<u64>>,
     /// The parent asked for a save (`deckcraft:request-save`) since the last frame.
     save_requested: Rc<Cell<bool>>,
-    /// The unsaved-changes state last reported to the parent.
+    /// The unsaved-work state last reported to the parent.
     reported: Rc<Cell<Option<bool>>>,
 }
 
@@ -86,9 +78,7 @@ impl Bridge {
             parent,
             origin,
             ack,
-            saves: Rc::default(),
             sent: Rc::default(),
-            opening: Rc::default(),
             stored: Rc::default(),
             unacked: Rc::default(),
             next_save_id: Rc::new(Cell::new(1)),
@@ -97,22 +87,25 @@ impl Bridge {
         })
     }
 
-    /// Send saved and exported files to the parent instead of downloading them, and hear files
-    /// from it.
+    /// Hand saved, exported and written files to the parent instead of downloading them, and
+    /// hear files from it.
     pub fn connect(&self, services: &mut Services, ctx: egui::Context) {
-        self.listen(ctx.clone());
-        let saves = Rc::clone(&self.saves);
-        let repaint = ctx.clone();
+        self.listen(ctx);
+        // Save, Save As, Export and Print go to the parent at once, with the presentation their
+        // bytes were made from, so a failed hand-off fails the save.
+        let bridge = self.clone();
+        services.host_save = Some(Box::new(move |save: &HostSave<'_>| bridge.hand_over(save)));
+        services.host_confirms_saves = self.ack;
+        // Nothing saves through `download` while `host_save` is set; it marks the browser build.
+        let bridge = self.clone();
         services.download = Some(Box::new(move |name: &str, bytes: &[u8]| {
-            saves.borrow_mut().push((name.to_string(), bytes.to_vec()));
-            repaint.request_repaint();
+            if let Err(e) = bridge.post_save(name, bytes, None, true) {
+                log::error!("couldn't hand {name} to the page: {e}");
+            }
         }));
-        let saves = Rc::clone(&self.saves);
-        services.write = Some(Box::new(move |name: &str, bytes: &[u8]| {
-            saves.borrow_mut().push((name.to_string(), bytes.to_vec()));
-            ctx.request_repaint();
-            Ok(())
-        }));
+        // Control-channel writes by path (`app.screenshot {path}`): never a presentation's file.
+        let bridge = self.clone();
+        services.write = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes, None, true).map(|_| ())));
     }
 
     pub fn set_author(app: &mut SlideApp, author: &str) {
@@ -130,67 +123,48 @@ impl Bridge {
         self.send(&[("type", "deckcraft:failed".into()), ("error", error.into())]);
     }
 
-    /// After each frame: a save the parent asked for runs, saves go to the parent with the
-    /// presentation they came from, stored saves mark their presentation saved, the parent hears
-    /// which presentation the file it sent became, the next sent file goes to the app, and the
-    /// parent hears when unsaved changes appear or go away.
+    /// After each frame: a save the parent asked for runs, stored saves mark their presentation
+    /// saved, the next sent file opens (and the parent hears which presentation it became), and
+    /// the parent hears when unsaved work appears or goes away.
     pub fn sync(&self, app: &mut SlideApp, ctx: &egui::Context) {
         if self.save_requested.take() && app.session.active().is_some() {
             app.save();
         }
-        self.post_saves(app);
         self.apply_stored(app);
-        if let Some((name, before)) = self.opening.take() {
-            let docs = app.session.documents();
-            let doc = crate::doc_ids::opened_doc(&before, docs.iter().map(|d| (d.uid, d.title.as_str())), &name);
-            self.send(&[("type", "deckcraft:opened".into()), ("name", name.as_str().into()), ("docId", id_value(doc))]);
-        }
         let next = self.sent.borrow_mut().pop_front();
         if let Some((name, bytes)) = next {
-            self.open_sent(app, name, &bytes);
+            self.open_sent(app, &name, &bytes);
             ctx.request_repaint();
         }
-        let dirty = app.session.documents().iter().any(|d| d.is_dirty());
+        let dirty = app.has_unsaved_work();
         if self.reported.get() != Some(dirty) && self.send(&[("type", "deckcraft:dirty".into()), ("dirty", dirty.into())]) {
             self.reported.set(Some(dirty));
         }
     }
 
-    /// Open a sent file like a dropped one. The untouched blank presentation the page started
-    /// with gives way to it.
-    fn open_sent(&self, app: &mut SlideApp, name: String, bytes: &[u8]) {
-        let before: Vec<u64> = app.session.documents().iter().map(|d| d.uid).collect();
+    /// Open a sent file like a dropped one and tell the parent which presentation it became. The
+    /// untouched blank presentation the page started with gives way to it.
+    fn open_sent(&self, app: &mut SlideApp, name: &str, bytes: &[u8]) {
         let replace_initial =
             app.session.documents().len() == 1 && app.session.documents().first().is_some_and(|d| d.path.is_none() && !d.is_dirty());
-        app.open_or_insert_bytes(&name, bytes);
-        if replace_initial && app.session.documents().len() > 1 {
+        let opened = app.open_or_insert_bytes(name, bytes);
+        if replace_initial && opened.is_some() && app.session.documents().len() > 1 {
             app.session.close_document(0);
         }
-        *self.opening.borrow_mut() = Some((name, before));
+        let doc = opened.filter(|o| o.in_place).map(|o| o.document);
+        self.send(&[("type", "deckcraft:opened".into()), ("name", name.into()), ("docId", id_value(doc))]);
     }
 
-    fn post_saves(&self, app: &mut SlideApp) {
-        let saves = std::mem::take(&mut *self.saves.borrow_mut());
-        for (path, bytes) in saves {
-            let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path);
-            let save_id = self.next_save_id.get();
-            self.next_save_id.set(save_id + 1);
-            let doc = app.session.active().map(|d| d.uid);
-            if let Err(e) = self.post_save(&name, &bytes, doc, save_id) {
-                log::error!("couldn't hand {name} to the page: {e}");
-                continue;
-            }
-            if !is_presentation(&name) {
-                continue;
-            }
-            let Some(active) = app.session.active_mut() else { continue };
-            let content = Arc::clone(&active.doc);
-            if self.ack {
-                self.unacked.borrow_mut().push(Unacked { save_id, doc: active.uid, content });
-            } else {
-                mark_saved(active, content, &name);
-            }
+    /// Post a Save, Save As, Export or Print. With `?ack=1` a save of the presentation waits for
+    /// the parent to store it.
+    fn hand_over(&self, save: &HostSave<'_>) -> Result<(), String> {
+        let save_id = self.post_save(save.name, save.bytes, Some(save.document), save.save_as)?;
+        if self.ack
+            && let Some(content) = &save.saved
+        {
+            self.unacked.borrow_mut().push(Unacked { save_id, doc: save.document, content: Arc::clone(content) });
         }
+        Ok(())
     }
 
     /// A stored save marks its presentation saved as it was then (later edits stay unsaved) and
@@ -200,29 +174,33 @@ impl Bridge {
         let stored = std::mem::take(&mut *self.stored.borrow_mut());
         let mut unacked = self.unacked.borrow_mut();
         for (save_id, name) in stored {
-            let Some(at) = unacked.iter().position(|u| u.save_id == save_id) else { continue };
-            let save = unacked.remove(at);
-            unacked.retain(|u| u.doc != save.doc || u.save_id > save_id);
+            let Some(save) = unacked.stored(save_id) else { continue };
             let Some(doc) = app.session.document_mut(save.doc) else { continue };
             mark_saved(doc, save.content, &name);
         }
         let open: Vec<u64> = app.session.documents().iter().map(|d| d.uid).collect();
-        unacked.retain(|u| open.contains(&u.doc));
+        unacked.retain_open(&open);
     }
 
-    fn post_save(&self, name: &str, bytes: &[u8], doc: Option<u64>, save_id: u64) -> Result<(), String> {
+    /// Post `deckcraft:save`; returns its `saveId`.
+    fn post_save(&self, path: &str, bytes: &[u8], doc: Option<u64>, save_as: bool) -> Result<u64, String> {
+        let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+        let save_id = self.next_save_id.get();
+        self.next_save_id.set(save_id.saturating_add(1));
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
         let message = message(&[
             ("type", "deckcraft:save".into()),
-            ("name", name.into()),
+            ("name", name.as_str().into()),
             ("bytes", buffer.clone().into()),
             ("docId", id_value(doc)),
             ("saveId", id_value(Some(save_id))),
+            ("saveAs", save_as.into()),
         ])
         .ok_or_else(|| "couldn't build the message".to_string())?;
         self.parent
             .post_message_with_transfer(&message, &self.origin, &js_sys::Array::of1(&buffer))
-            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
+            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
+        Ok(save_id)
     }
 
     fn listen(&self, ctx: egui::Context) {
@@ -230,6 +208,7 @@ impl Bridge {
         let origin = self.origin.clone();
         let sent = Rc::clone(&self.sent);
         let stored = Rc::clone(&self.stored);
+        let unacked = Rc::clone(&self.unacked);
         let save_requested = Rc::clone(&self.save_requested);
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
@@ -246,6 +225,12 @@ impl Bridge {
                     let Some(save_id) = number(&data, "saveId") else { return };
                     let Some(name) = string(&data, "name").filter(|n| !n.trim().is_empty()) else { return };
                     stored.borrow_mut().push((save_id, name));
+                }
+                Some("deckcraft:discard") => {
+                    if let Some(save_id) = number(&data, "saveId") {
+                        unacked.borrow_mut().discard(save_id);
+                    }
+                    return;
                 }
                 Some("deckcraft:request-save") => save_requested.set(true),
                 _ => return,
@@ -268,10 +253,6 @@ fn mark_saved(doc: &mut deckcraft_engine::DocState, content: Arc<Presentation>, 
     if doc.path.is_none() {
         doc.title = std::path::Path::new(name).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| name.to_string());
     }
-}
-
-fn is_presentation(name: &str) -> bool {
-    name.rsplit_once('.').is_some_and(|(_, ext)| PRESENTATION_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 
 /// A presentation id or save number as a JS number (ids stay far below 2^53), `null` for none.

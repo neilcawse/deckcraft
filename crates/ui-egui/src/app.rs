@@ -94,6 +94,7 @@ impl SlideApp {
             last_recovery: 0.0,
             quit_confirmed: false,
             notes_buf: (0, usize::MAX, notes::Draft::default()),
+            drafting: false,
             ui_fonts: uifonts::UiFonts::default(),
             thumb_drag: None,
             selpane: selpane::State::default(),
@@ -123,6 +124,14 @@ impl SlideApp {
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
         self
+    }
+
+    /// Work the user would lose if the app went away now: a presentation with unsaved changes,
+    /// or typing the last pass drew that isn't in its presentation yet (a notes, outline,
+    /// SmartArt, comment, alt text or property field being edited), which a page's leave-page
+    /// guard counts too.
+    pub fn has_unsaved_work(&self) -> bool {
+        self.drafting || self.session.documents().iter().any(|d| d.is_dirty())
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
@@ -289,6 +298,8 @@ impl SlideApp {
             self.requeue_injected_synthetic();
             return;
         }
+        // Drafts drawn in this pass say so again (a discarded pass above keeps the last answer).
+        self.drafting = false;
         let t0 = now_ms();
         let t = theme::Tokens::get(&ctx);
         self.note_ui_text(&ctx);

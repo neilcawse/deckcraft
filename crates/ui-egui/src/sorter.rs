@@ -424,6 +424,7 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
         draft.edited = false;
         let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
     }
+    app.drafting |= draft.edited;
     let base = notes_of(app);
     child.data_mut(|d| d.insert_temp(id, (base, draft)));
     let nav = ui.input(|i| (i.key_pressed(egui::Key::PageDown), i.key_pressed(egui::Key::PageUp)));
@@ -509,6 +510,7 @@ fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deck
         if !resp.has_focus() {
             ui.data_mut(|d| d.remove::<String>(id));
         } else {
+            app.drafting |= v != cur_title;
             ui.data_mut(|d| d.insert_temp(id, v));
         }
     });
@@ -533,6 +535,7 @@ fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deck
             if !resp.has_focus() {
                 ui.data_mut(|d| d.remove::<String>(id));
             } else {
+                app.drafting |= v != cur_text;
                 ui.data_mut(|d| d.insert_temp(id, v.clone()));
             }
         });

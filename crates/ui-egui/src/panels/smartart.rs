@@ -75,6 +75,8 @@ pub(super) fn smartart(app: &mut SlideApp, ui: &mut Ui) {
             }
         }
     }
+    // Lines typed but not yet committed (committed ones made the presentation unsaved instead).
+    app.drafting |= commit.is_none() && action.is_none() && drafts.iter().zip(&texts).any(|(d, t)| d != t);
     app.ui.smartart_drafts.1 = drafts;
     if let Some((cmd, mut p)) = action {
         if let Some(o) = p.as_object_mut() {

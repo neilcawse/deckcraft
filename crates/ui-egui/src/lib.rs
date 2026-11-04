@@ -72,7 +72,7 @@ pub use panels::notes;
 pub use panels::selpane;
 pub use panels::thumbs;
 pub use ribbon::qat;
-pub use services::{DownloadFn, Inbox, InboxEvent, InboxFile, OpenAsyncFn, PickFn, ReadFn, Services, WriteFn};
+pub use services::{DownloadFn, HostSave, HostSaveFn, Inbox, InboxEvent, InboxFile, OpenAsyncFn, OpenedFile, PickFn, ReadFn, Services, WriteFn};
 use state::{FilePlace, FilePurpose, ImeDescriptorKey, ImeDestination, ImeTerminalStamp};
 pub use state::{RECENT_MAX, UiState, ViewMode, ZOOM_RANGE};
 
@@ -310,6 +310,9 @@ pub struct SlideApp {
     /// Quit was confirmed (changes saved or discarded): let the window close.
     pub quit_confirmed: bool,
     pub(crate) notes_buf: (u64, usize, notes::Draft),
+    /// The last full pass drew typing not yet in a presentation (a notes, outline, SmartArt,
+    /// comment, alt text or property draft): see [`SlideApp::has_unsaved_work`].
+    pub(crate) drafting: bool,
     /// Faces borrowed from the font database for text the interface fonts can't draw (#101).
     pub ui_fonts: uifonts::UiFonts,
     /// Slide drag in the thumbnail pane or the Slide Sorter: the dragged slides and the drop gap.
@@ -455,6 +458,8 @@ mod field_frame_tests;
 mod find_dialog_tests;
 #[cfg(test)]
 mod gpu_lock;
+#[cfg(test)]
+mod host_save_tests;
 #[cfg(test)]
 mod huge_deck_tests;
 #[cfg(test)]

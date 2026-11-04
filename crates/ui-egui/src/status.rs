@@ -304,6 +304,7 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
                 draft.edited = false;
                 let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
             }
+            app.drafting |= draft.edited;
             app.notes_buf.2 = draft;
         });
 }

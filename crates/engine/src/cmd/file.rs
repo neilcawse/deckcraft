@@ -298,13 +298,21 @@ fn open(_s: &mut Session, _p: &Value) -> Result<Value> {
     Err(EngineError::Other("use file.openBytes in the browser".into()))
 }
 
+/// `file.openBytes`: also returns the new presentation's `uid` and `inPlace`, whether saving it
+/// over the file it came from keeps what the file had (as `file.open` keeps the path): false for
+/// a repaired copy of a damaged file and for bytes read as an outline.
 fn open_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param(p, "name").unwrap_or("Presentation");
     let data = str_param(p, "data").and_then(base64_decode).ok_or_else(|| bad("file.openBytes", "missing or invalid base64 `data`"))?;
     let (doc, damaged) = open_checked(name, &data)?;
+    let in_place = (deckcraft_format::sniff(&data) || deckcraft_pptx::sniff(&data)) && damaged.is_empty();
     let i = add_opened(s, name, None, doc);
     report_damage(s, &damaged)?;
-    Ok(json!({"document": i, "missingFonts": s.doc()?.missing_fonts, "damagedMedia": damaged.media, "lostSlides": damaged.slides}))
+    let st = s.doc()?;
+    Ok(json!({
+        "document": i, "uid": st.uid, "inPlace": in_place, "missingFonts": st.missing_fonts,
+        "damagedMedia": damaged.media, "lostSlides": damaged.slides,
+    }))
 }
 
 /// Tell the user which pictures, media and slides a damaged file lost, and mark the copy repaired.
@@ -490,7 +498,7 @@ fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
 fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").map(String::from).or_else(|| s.active().and_then(|d| d.path.clone()));
     let Some(path) = path else {
-        s.ui_requests.push(crate::UiRequest::PickFile { purpose: "saveAs".into() });
+        s.ui_requests.push(crate::UiRequest::PickFile { purpose: "save".into() });
         return Ok(json!({"needsPath": true}));
     };
     let format = str_param(p, "format").unwrap_or(format_for_path(&path));

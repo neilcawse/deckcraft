@@ -429,6 +429,7 @@ pub enum UiRequest {
     Message {
         text: String,
     },
+    /// The UI picks a file: `save` (Save of a presentation without a file) or `saveAs`.
     PickFile {
         purpose: String,
     },

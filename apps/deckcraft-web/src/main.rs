@@ -9,7 +9,8 @@
 //! - File → Open and Insert → Pictures/Audio/Video use the browser file picker; bytes arrive
 //!   asynchronously through `Services::inbox`, applied to the document, slide and operation
 //!   that started the pick (a dismissed picker or a closed document drops the file);
-//! - Save and Export trigger a browser download;
+//! - Save and Export trigger a browser download (with `?host=parent`, they go to the framing
+//!   page instead: see `host`);
 //! - dropped files are read asynchronously by `web::WebShell` and delivered through the inbox;
 //! - preferences are not persisted.
 //!
@@ -20,10 +21,10 @@
 
 #[cfg(target_arch = "wasm32")]
 mod host;
-#[cfg(any(target_arch = "wasm32", test))]
-mod doc_ids;
 #[cfg(target_arch = "wasm32")]
 mod presenter;
+#[cfg(any(target_arch = "wasm32", test))]
+mod unacked;
 #[cfg(target_arch = "wasm32")]
 mod web;
 

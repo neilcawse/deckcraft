@@ -338,10 +338,18 @@ fn dlg_close(app: &mut SlideApp, ui: &mut Ui, _d: &mut Dialog) -> bool {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let save = ui.add(egui::Button::new(egui::RichText::new("Save").color(t.accent_text)).fill(t.accent).min_size(vec2(72.0, 24.0)));
             if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                app.save();
-                // In the browser a save is a download: the presentation stays "unsaved".
-                let web = app.services.pick_save.is_none() && app.services.download.is_some();
-                if web || app.session.active().is_some_and(|d| !d.is_dirty()) {
+                let handed = app.save();
+                let dirty = app.session.active().is_some_and(|d| d.is_dirty());
+                if app.services.host_save.is_some() && app.services.host_confirms_saves {
+                    // The host page marks the presentation saved once it has stored the file:
+                    // until then it stays open, and Close again closes it then.
+                    if !dirty {
+                        run(app, "file.close", json!({}));
+                    } else if handed {
+                        app.set_status("Waiting for the save to finish…");
+                    }
+                } else if !dirty || (handed && app.web_saves()) {
+                    // In the browser a save is a download: the presentation stays "unsaved".
                     run(app, "file.close", json!({}));
                 }
                 done = true;
@@ -363,7 +371,9 @@ fn dlg_comment(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
         run(app, "comment.add", json!({"text": v}));
         app.ui.pane = Some("comments".into());
     }
-    ok || cancel
+    let done = ok || cancel;
+    app.drafting |= !done && !v.trim().is_empty();
+    done
 }
 
 fn dlg_bullets(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {

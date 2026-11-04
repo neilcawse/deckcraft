@@ -108,6 +108,8 @@ pub(super) fn info(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
                         // Show the presentation's value unless the field is being edited (undo...).
                         draft.clone_from(&saved);
                         ui.ctx().request_repaint();
+                    } else if *draft != saved {
+                        app.drafting = true;
                     }
                     ui.end_row();
                 }

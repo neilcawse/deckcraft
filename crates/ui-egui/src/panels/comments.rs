@@ -156,6 +156,7 @@ fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: 
                         run(app, "comment.reply", json!({"index": index, "text": txt}));
                         txt.clear();
                     }
+                    app.drafting |= !txt.trim().is_empty();
                     ui.data_mut(|d| d.insert_temp(id, txt));
                 });
             });

@@ -11,6 +11,35 @@ pub type OpenAsyncFn = Box<dyn FnMut(&str, u64)>;
 
 pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
 
+/// A file handed to the host page ([`Services::host_save`]), described when its bytes were made.
+pub struct HostSave<'a> {
+    pub name: &'a str,
+    pub bytes: &'a [u8],
+    /// The command asked for a new file (Save As, Export, Print): the page never writes it over
+    /// the presentation's own file. False for Save.
+    pub save_as: bool,
+    /// The presentation it came from ([`deckcraft_engine::DocState::uid`]).
+    pub document: u64,
+    /// A Save or Save As of the presentation itself: its content as saved, which a host that
+    /// confirms saves marks saved ([`Services::host_confirms_saves`]). `None` for copies (Export,
+    /// Print).
+    pub saved: Option<std::sync::Arc<deckcraft_engine::model::Presentation>>,
+}
+
+/// [`Services::host_save`]. An error means the page didn't get the file, and the save failed.
+pub type HostSaveFn = Box<dyn FnMut(&HostSave<'_>) -> Result<(), String>>;
+
+/// The presentation a file handed to [`SlideApp::open_or_insert_bytes`] opened as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenedFile {
+    /// Its [`deckcraft_engine::DocState::uid`].
+    pub document: u64,
+    /// Saving it over the file keeps what the file had: a native or PowerPoint package read
+    /// whole. False for a repaired copy of a damaged file and for a file read as an outline;
+    /// those must go to a new file.
+    pub in_place: bool,
+}
+
 /// A file the host finished reading for the request `id` from [`SlideApp::begin_external_file`].
 #[derive(Clone, Debug)]
 pub struct InboxFile {
@@ -49,6 +78,15 @@ pub struct Services {
     pub open_async: Option<OpenAsyncFn>,
     /// Hand bytes to the user as a named file (browser download).
     pub download: Option<DownloadFn>,
+    /// Web, framed by a page that keeps the files (`?host=parent`): Save, Save As, Export and
+    /// Print hand their file to the page here instead of `download`, with the presentation it
+    /// came from and whether it asked for a new file ([`HostSave`]). A Save or Save As then
+    /// counts as saving the presentation, unless `host_confirms_saves`.
+    pub host_save: Option<HostSaveFn>,
+    /// With `host_save`: the page says when it has stored a save, and only then does the
+    /// presentation count as saved (the host marks it). Until then the Save Changes prompt's
+    /// Save doesn't close the presentation.
+    pub host_confirms_saves: bool,
     pub inbox: Option<Inbox>,
     /// Image on the system clipboard (PNG bytes), when the host can read one.
     pub clipboard_image: Option<Box<dyn FnMut() -> Option<Vec<u8>>>>,
