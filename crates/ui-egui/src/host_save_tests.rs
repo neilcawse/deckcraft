@@ -129,13 +129,13 @@ fn save_as_export_and_print_ask_for_a_new_file() {
     assert_eq!(
         got,
         [
-            ("Presentation 1.pptx".to_string(), false, true),
-            ("Presentation 1.pptx".to_string(), false, true),
-            ("Presentation 1.pptx".to_string(), true, true),
-            ("Presentation 1.pptx".to_string(), true, true),
-            ("Presentation 1.deckcraft".to_string(), true, true),
-            ("Presentation 1.pptx".to_string(), true, false),
-            ("Presentation 1.pdf".to_string(), true, false),
+            ("Presentation1.pptx".to_string(), false, true),
+            ("Presentation1.pptx".to_string(), false, true),
+            ("Presentation1.pptx".to_string(), true, true),
+            ("Presentation1.pptx".to_string(), true, true),
+            ("Presentation1.deckcraft".to_string(), true, true),
+            ("Presentation1.pptx".to_string(), true, false),
+            ("Presentation1.pdf".to_string(), true, false),
         ],
     );
 }
