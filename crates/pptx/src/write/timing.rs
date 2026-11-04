@@ -577,13 +577,12 @@ fn click_pars(w: &mut W, x: &mut Exp, ids: &mut Ids, clicks: &Groups, interactiv
     }
 }
 
-/// Write `p:timing` for a slide's animations.
+/// Write `p:timing` for a slide's animations and media settings.
 pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idmap: &IdMap) {
     let mut grp_count: std::collections::HashMap<u32, u32> = Default::default();
     let mut main: Vec<Eff> = vec![];
     let mut triggered: Vec<(u32, Vec<Eff>)> = vec![];
     let mut bld: Vec<(u32, u32, bool)> = vec![];
-    // The last paragraph effect written: (shape, class, trigger, grpId).
     let mut prev_para: Option<(ShapeId, AnimClass, Option<ShapeId>, u32)> = None;
     for a in anims.iter().take(10_000) {
         let Some(spid) = idmap.get(a.shape) else {
@@ -596,9 +595,6 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
         let text = shape.text.as_ref().filter(|_| a.text_build == TextBuild::ByParagraph && is_text_sp);
         let roles = text.map(paragraph_build_roles).unwrap_or_default();
         let by_para = roles.contains(&BuildRole::Top);
-        // PowerPoint keeps a shape's consecutive paragraph effects in one build (`grpId`) marked
-        // `build="p"`; the reader turns them back into a by-paragraph build only if that plays them
-        // the same way.
         let para_effect = !by_para && text_sp && a.paragraph.is_some();
         let joins = para_effect && prev_para.is_some_and(|(s, c, t, _)| s == a.shape && c == a.class && t == a.trigger);
         let grp = match prev_para {
@@ -613,8 +609,6 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
         prev_para = para_effect.then_some((a.shape, a.class, a.trigger, grp));
         let mut effs = vec![];
         if by_para {
-            // One effect per paragraph the build animates on its own, deeper ones with their
-            // parent; indices in the file count empty paragraphs too.
             let mut tops = 0;
             for (i, role) in roles.iter().enumerate() {
                 let start = match role {
@@ -648,7 +642,16 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
             None => main.extend(effs),
         }
     }
-    if main.is_empty() && triggered.is_empty() {
+    let mut media = Vec::new();
+    deckcraft_model::walk(shapes, &mut |shape, _| {
+        if let ShapeKind::Media(clip) = &shape.kind
+            && ((clip.volume - 1.0).abs() > 1e-6 || clip.hide_while_not_playing || clip.loop_play || clip.full_screen)
+            && let Some(spid) = idmap.get(shape.id)
+        {
+            media.push((spid, clip));
+        }
+    });
+    if main.is_empty() && triggered.is_empty() && media.is_empty() {
         return;
     }
     let mut ids = Ids(0);
@@ -718,6 +721,28 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
         trig_cond(w);
         w.close("p:nextCondLst");
         w.close("p:seq");
+    }
+    for (spid, clip) in &media {
+        let tag = if clip.video { "p:video" } else { "p:audio" };
+        w.open(tag, A::new().t("fullScrn", clip.full_screen));
+        let mut cm = A::new().a("vol", (clip.volume.clamp(0.0, 1.0) * 100_000.0).round() as u32);
+        if clip.volume <= 1e-6 {
+            cm = cm.t("mute", true);
+        }
+        if clip.hide_while_not_playing {
+            cm = cm.a("showWhenStopped", 0);
+        }
+        w.open("p:cMediaNode", cm);
+        w.open("p:cTn", A::new().a("id", ids.next()).a("fill", "hold").a("display", 0).o("repeatCount", clip.loop_play.then_some("indefinite")));
+        w.open0("p:stCondLst");
+        w.empty("p:cond", A::new().a("delay", "indefinite"));
+        w.close("p:stCondLst");
+        w.close("p:cTn");
+        w.open0("p:tgtEl");
+        w.empty("p:spTgt", A::new().a("spid", *spid));
+        w.close("p:tgtEl");
+        w.close("p:cMediaNode");
+        w.close(tag);
     }
     w.close("p:childTnLst");
     w.close("p:cTn");

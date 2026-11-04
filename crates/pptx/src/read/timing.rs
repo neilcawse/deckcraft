@@ -239,12 +239,12 @@ pub fn animations(imp: &mut Imp, part: &Part, ctx: &IdCtx, timing: &El, shapes: 
     let Some(tn) = timing.child("tnLst") else { return vec![] };
     let mut found = vec![];
     collect(tn, At { trigger: None, group: 0, offset: 0 }, &mut 0, &mut found, 0);
-    // Paragraph builds (`bldP build="p"`) by (spid, grpId).
-    let by_para: Vec<(u32, String)> = timing
+    // Paragraph builds are inferred unless a matching bldP explicitly opts out.
+    let not_by_para: Vec<(u32, String)> = timing
         .child("bldLst")
         .map(|b| {
             b.children_named("bldP")
-                .filter(|p| p.attr("build") == Some("p"))
+                .filter(|p| p.attr("build") != Some("p"))
                 .filter_map(|p| Some((p.u32("spid")?, p.attr("grpId").unwrap_or("0").to_string())))
                 .collect()
         })
@@ -314,7 +314,7 @@ pub fn animations(imp: &mut Imp, part: &Part, ctx: &IdCtx, timing: &El, shapes: 
             a.color = dml::color(clr);
         }
         let grp = c.attr("grpId").unwrap_or("0").to_string();
-        let build = paragraph.is_some() && by_para.iter().any(|(s, g)| *s == file_id && *g == grp);
+        let build = paragraph.is_some() && !not_by_para.iter().any(|(s, g)| *s == file_id && *g == grp);
         out.push((a, file_id, grp, build));
         at.push((f.trigger, f.group, f.offset));
     }
