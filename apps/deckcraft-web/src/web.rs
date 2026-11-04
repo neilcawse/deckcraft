@@ -30,7 +30,13 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
-        let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
+        // `?host=parent`: a same-origin page framing DeckCraft opens presentations in it and
+        // stores what it saves (`host`); `&ack=1` when it confirms each save.
+        let bridge = if query_param("host").as_deref() == Some("parent") {
+            crate::host::Bridge::new(query_param("ack").as_deref() == Some("1"))
+        } else {
+            None
+        };
         let app_bridge = bridge.clone();
         let result = eframe::WebRunner::new()
             .start(
@@ -102,9 +108,6 @@ struct WebShell {
 impl eframe::App for WebShell {
     /// Delegate one eframe logic pass to the wrapped application.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(bridge) = &self.bridge {
-            bridge.drain_opens(&mut self.app);
-        }
         self.app.logic(ctx);
         if self.app.show.is_none()
             && let Some(host) = self.app.services.presenter.as_mut()
@@ -142,7 +145,7 @@ impl eframe::App for WebShell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
         if let Some(bridge) = &self.bridge {
-            bridge.sync(&mut self.app);
+            bridge.sync(&mut self.app, ui.ctx());
         }
     }
 }
