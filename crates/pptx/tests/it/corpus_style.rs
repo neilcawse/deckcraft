@@ -239,6 +239,21 @@ fn theme_and_bevel_survive(once: &Presentation, twice: &Presentation) {
     let raw = bevel.raw3d.as_deref().unwrap_or("");
     assert!(raw.contains("bevelT") && raw.contains("angle") && raw.contains("scene3d"), "{raw}");
     assert_eq!(by_name(twice, "Bevel").effects.as_ref().and_then(|e| e.raw3d.as_deref()), Some(raw));
+
+    let mut p3 = defaults::new_presentation(None);
+    let dgm_draw = p3
+        .add_media(
+            "drawing1.xml",
+            "application/vnd.ms-office.drawingml.diagramDrawing+xml",
+            br#"<dsp:drawing xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram"><dsp:spTree/></dsp:drawing>"#.to_vec(),
+        )
+        .expect("media");
+    let layout = defaults::layout_of_kind(&p3, deckcraft_model::LayoutType::Blank).unwrap_or_default();
+    let mut s3 = defaults::new_slide(&mut p3, layout).expect("slide");
+    s3.diagram_drawings.push(dgm_draw);
+    p3.slides.push(Arc::new(s3));
+    let r3 = round(&p3);
+    assert_eq!(r3.slides.last().expect("slide").diagram_drawings.len(), 1);
 }
 
 fn connector_glue_survives(p: &Presentation, once: &Presentation, twice: &Presentation) {

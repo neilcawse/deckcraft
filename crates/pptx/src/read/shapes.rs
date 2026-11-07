@@ -27,6 +27,8 @@ pub struct IdCtx {
     /// Always allocate new ids (shapes pulled in from other parts).
     pub fresh: bool,
     pub count: usize,
+    /// Normalized target paths of `diagramDrawing` parts consumed by modeled SmartArt shapes.
+    pub diagram_drawings: HashSet<String>,
 }
 
 impl IdCtx {
@@ -437,7 +439,7 @@ fn frame(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El, depth: usize) -> S
             return s;
         }
         if uri.ends_with("/diagram")
-            && let Some(g) = smartart(imp, part, gd, &s, depth)
+            && let Some(g) = smartart(imp, part, ctx, gd, &s, depth)
         {
             return g;
         }
@@ -560,7 +562,7 @@ fn diagram_data(imp: &mut Imp, target: &str) -> Option<deckcraft_model::MediaId>
 }
 
 /// SmartArt: read the pre-drawn shapes of its drawing part as a group.
-fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) -> Option<Shape> {
+fn smartart(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, gd: &El, frame: &Shape, depth: usize) -> Option<Shape> {
     if depth > 8 {
         return None;
     }
@@ -584,6 +586,7 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
     g.diagram = diagram_outline(imp, part, rel_ids, &data.root);
     // Node pictures, from the blips of the data model's presentation points.
     if let Some(d) = &mut g.diagram {
+        ctx.diagram_drawings.insert(crate::opc::norm(&drawing_rel));
         let rels = imp.pkg.rels(&dm.target);
         for (k, rid) in crate::dgm::node_pictures(&data.root) {
             let Some(target) = rels.get(&rid).filter(|r| !r.external).map(|r| r.target.clone()) else { continue };
@@ -706,15 +709,17 @@ fn text_area(geom: &Geom, w: f64, h: f64) -> deckcraft_geom::Rect {
 /// parts kept to be written back.
 fn diagram_outline(imp: &Imp, part: &Part, rel_ids: &El, data: &El) -> Option<deckcraft_model::Diagram> {
     let nodes = crate::dgm::outline(data);
-    if nodes.is_empty() {
-        return None;
-    }
     let raw = |attr: &str| -> Option<String> {
         let rel = part.rels.get(rel_ids.attr(attr)?)?;
         let bytes = imp.pkg.get(&rel.target)?;
         (bytes.len() <= 4 << 20).then(|| String::from_utf8(bytes.to_vec()).ok()).flatten()
     };
     let layout_xml = raw("r:lo");
+    let style_xml = raw("r:qs");
+    let colors_xml = raw("r:cs");
+    if nodes.is_empty() && layout_xml.is_none() && style_xml.is_none() && colors_xml.is_none() {
+        return None;
+    }
     let (layout_id, cat) = layout_xml
         .as_deref()
         .and_then(|x| crate::xml::parse(x.as_bytes()).ok())
@@ -741,8 +746,8 @@ fn diagram_outline(imp: &Imp, part: &Part, rel_ids: &El, data: &El) -> Option<de
         imported: true,
         layout_id: id,
         layout_xml,
-        style_xml: raw("r:qs"),
-        colors_xml: raw("r:cs"),
+        style_xml,
+        colors_xml,
     })
 }
 
