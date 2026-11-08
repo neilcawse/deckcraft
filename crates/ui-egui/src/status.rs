@@ -304,7 +304,7 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
                 draft.edited = false;
                 let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
             }
-            app.drafting |= draft.edited;
+            // `has_unsaved_work` reads `notes_buf` itself, so an edit still counts if this pane is hidden.
             app.notes_buf.2 = draft;
         });
 }

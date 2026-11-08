@@ -371,9 +371,7 @@ fn dlg_comment(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
         run(app, "comment.add", json!({"text": v}));
         app.ui.pane = Some("comments".into());
     }
-    let done = ok || cancel;
-    app.drafting |= !done && !v.trim().is_empty();
-    done
+    ok || cancel
 }
 
 fn dlg_bullets(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {

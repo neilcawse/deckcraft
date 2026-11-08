@@ -8,13 +8,15 @@
 //!   `docId` is the presentation it became, or `null` when it must not be written over the sent
 //!   file: it didn't open, went into the open presentation (an outline), or opened as a repaired
 //!   copy of a damaged file.
-//! - `deckcraft:save` (to the parent): `{ name, bytes, docId, saveId, saveAs }` (`bytes` a
+//! - `deckcraft:save` (to the parent): `{ name, bytes, docId, saveId, saveAs, copy }` (`bytes` a
 //!   transferred `ArrayBuffer`) for every file DeckCraft would otherwise download: Save and Save
 //!   As (.pptx / .deckcraft), Export and Print. `docId` is the presentation the bytes were made
 //!   from, the same number `deckcraft:opened` gave for a sent file, so the parent writes it back
 //!   only to that file. `saveAs` is true when the command asked for a new file (Save As, Export,
-//!   Print), false for Save. A file the control channel writes by path has `docId: null` and
-//!   `saveAs: true`: it is never a presentation's file. `saveId` numbers the saves. The parent
+//!   Print), false for Save. `copy` is true when the file is not the presentation's own file
+//!   (Export, including Export to .pptx, and Print): the parent stores it as a separate file and
+//!   must not make it the presentation's file. A file the control channel writes by path has
+//!   `docId: null`, `saveAs: true` and `copy: true`. `saveId` numbers the saves. The parent
 //!   stores it and reports failures itself.
 //! - `deckcraft:saved` (from the parent, with `?ack=1`): `{ saveId, name }`, the save is stored
 //!   as `name`. Only then does the presentation count as saved, as it was when it was saved; a
@@ -99,13 +101,13 @@ impl Bridge {
         // Nothing saves through `download` while `host_save` is set; it marks the browser build.
         let bridge = self.clone();
         services.download = Some(Box::new(move |name: &str, bytes: &[u8]| {
-            if let Err(e) = bridge.post_save(name, bytes, None, true) {
+            if let Err(e) = bridge.post_save(name, bytes, None, true, true) {
                 log::error!("couldn't hand {name} to the page: {e}");
             }
         }));
         // Control-channel writes by path (`app.screenshot {path}`): never a presentation's file.
         let bridge = self.clone();
-        services.write = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes, None, true).map(|_| ())));
+        services.write = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes, None, true, true).map(|_| ())));
     }
 
     pub fn set_author(app: &mut SlideApp, author: &str) {
@@ -158,7 +160,7 @@ impl Bridge {
     /// Post a Save, Save As, Export or Print. With `?ack=1` a save of the presentation waits for
     /// the parent to store it.
     fn hand_over(&self, save: &HostSave<'_>) -> Result<(), String> {
-        let save_id = self.post_save(save.name, save.bytes, Some(save.document), save.save_as)?;
+        let save_id = self.post_save(save.name, save.bytes, Some(save.document), save.save_as, save.saved.is_none())?;
         if self.ack
             && let Some(content) = &save.saved
         {
@@ -183,7 +185,7 @@ impl Bridge {
     }
 
     /// Post `deckcraft:save`; returns its `saveId`.
-    fn post_save(&self, path: &str, bytes: &[u8], doc: Option<u64>, save_as: bool) -> Result<u64, String> {
+    fn post_save(&self, path: &str, bytes: &[u8], doc: Option<u64>, save_as: bool, copy: bool) -> Result<u64, String> {
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
         let save_id = self.next_save_id.get();
         self.next_save_id.set(save_id.saturating_add(1));
@@ -195,6 +197,7 @@ impl Bridge {
             ("docId", id_value(doc)),
             ("saveId", id_value(Some(save_id))),
             ("saveAs", save_as.into()),
+            ("copy", copy.into()),
         ])
         .ok_or_else(|| "couldn't build the message".to_string())?;
         self.parent

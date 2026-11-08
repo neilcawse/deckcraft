@@ -97,6 +97,7 @@ fn focus_comment(app: &mut SlideApp, slide: usize, index: usize) {
 
 /// Render one comment card, preserving its slide/index identity and focus state through actions.
 fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: &deckcraft_model::Comment, focused: bool) {
+    let Some(doc) = app.session.active().map(|st| st.uid) else { return };
     let t = Tokens::get(ui.ctx());
     let stroke = if focused { Stroke::new(2.0, t.accent) } else { Stroke::NONE };
     let shown = egui::Frame::NONE
@@ -137,27 +138,33 @@ fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("🗑").clicked() {
                         let _ = app.run("slide.go", json!({"index": slide}));
-                        let _ = app.run("comment.delete", json!({"index": index}));
+                        let deleted = app.run("comment.delete", json!({"index": index})).is_ok();
                         match app.ui.comment_focus {
                             Some((fs, fi)) if fs == slide && fi == index => app.ui.comment_focus = None,
                             Some((fs, fi)) if fs == slide && fi > index => app.ui.comment_focus = Some((fs, fi - 1)),
                             _ => {}
+                        }
+                        if deleted {
+                            // The reply goes with its comment; the ones under later comments move up with them.
+                            app.drafts.comment_deleted(doc, slide, index);
+                            // This card is gone: the reply field is not drawn for it.
+                            return;
                         }
                     }
                     if ui.small_button(if c.resolved { "Reopen" } else { "Resolve" }).clicked() {
                         focus_comment(app, slide, index);
                         run(app, "comment.resolve", json!({"index": index, "resolved": !c.resolved}));
                     }
-                    let id = ui.scope_id().with(("reply", slide, index));
-                    let mut txt: String = ui.data_mut(|d| d.get_temp(id).unwrap_or_default());
+                    // The draft is the app's, not egui's temporary data: it is still there when the
+                    // pane is shown again, and it counts as unsaved work meanwhile.
+                    let mut txt = app.drafts.reply(doc, slide, index);
                     let r = ui.add(egui::TextEdit::singleline(&mut txt).hint_text("Reply…").desired_width(ui.available_width()));
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !txt.trim().is_empty() {
                         focus_comment(app, slide, index);
                         run(app, "comment.reply", json!({"index": index, "text": txt}));
                         txt.clear();
                     }
-                    app.drafting |= !txt.trim().is_empty();
-                    ui.data_mut(|d| d.insert_temp(id, txt));
+                    app.drafts.set_reply(doc, slide, index, txt);
                 });
             });
         });

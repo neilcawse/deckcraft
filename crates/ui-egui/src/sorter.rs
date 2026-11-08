@@ -365,6 +365,7 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
     let Some(st) = app.session.active() else { return };
     let doc = st.doc.clone();
     let idx = st.selection.slide;
+    let uid = st.uid;
     let page_h = avail.height() - 40.0;
     let page_w = page_h * 8.5 / 11.0;
     let page = Rect::from_center_size(avail.center(), vec2(page_w, page_h));
@@ -398,14 +399,13 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
     let notes_rect = to_screen((notes_box.x0, notes_box.y0, notes_box.x1, notes_box.y1));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(notes_rect));
     // A draft belongs to this document and to the notes it started from (#413): another document,
-    // a reorder or an undo that changes them drops it.
-    let id = egui::Id::unique(("notespage", st.uid, idx));
+    // a reorder or an undo that changes them drops it. The app keeps it, so it counts as unsaved
+    // work although this view isn't drawn (and so does a draft left on another slide).
     let edit_id = egui::Id::unique(("notespage-edit", idx));
     let focused = child.ctx().memory(|m| m.has_focus(edit_id));
     let notes_of = |app: &SlideApp| app.session.active().and_then(|st| st.doc.slides.get(idx)).map(|s| s.notes.clone()).unwrap_or_default();
     let notes = notes_of(app);
-    let stored: Option<(deckcraft_model::text::TextBody, crate::notes::Draft)> = child.data_mut(|d| d.get_temp(id));
-    let mut draft = stored.filter(|(base, _)| *base == notes).map(|(_, d)| d);
+    let mut draft = app.drafts.notes_page(uid, idx, &notes);
     // Save an edited draft once the field has lost focus, before anything reloads it.
     if !focused && let Some(d) = draft.as_mut().filter(|d| d.edited) {
         d.edited = false;
@@ -424,9 +424,12 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
         draft.edited = false;
         let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
     }
-    app.drafting |= draft.edited;
     let base = notes_of(app);
-    child.data_mut(|d| d.insert_temp(id, (base, draft)));
+    if draft.edited || r.has_focus() {
+        app.drafts.keep_notes_page(uid, idx, base, draft);
+    } else {
+        app.drafts.drop_notes_page(uid, idx);
+    }
     let nav = ui.input(|i| (i.key_pressed(egui::Key::PageDown), i.key_pressed(egui::Key::PageUp)));
     if nav.0 {
         let _ = app.run("slide.next", json!({}));

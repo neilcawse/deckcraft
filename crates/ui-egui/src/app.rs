@@ -6,7 +6,7 @@ use super::state::{FilePlace, FilePurpose, ImeDescriptorKey, ImeDestination, Ime
 use super::updates_ui;
 use super::{
     AnimPreview, ControlRequest, FileTarget, HashMap, ImeCancelled, ImeComposition, ImeResetPhase, ImeTerminalPending, InputTarget, Mods,
-    PendingFile, Perf, Receiver, Session, SlideApp, Target, UI_COMMANDS, UiRequest, Value, backstage, canvas, capture, dialogs, doc_window,
+    PendingFile, Perf, Receiver, Session, SlideApp, Target, UI_COMMANDS, UiRequest, Value, backstage, canvas, capture, dialogs, doc_window, drafts,
     eyedropper, json, media, menus, notes, panes, preview, qat, ribbon, selpane, show, sorter, status, textures, theme, thumbs, toast, uifonts,
 };
 
@@ -95,6 +95,7 @@ impl SlideApp {
             quit_confirmed: false,
             notes_buf: (0, usize::MAX, notes::Draft::default()),
             drafting: false,
+            drafts: drafts::Drafts::default(),
             ui_fonts: uifonts::UiFonts::default(),
             thumb_drag: None,
             selpane: selpane::State::default(),
@@ -126,12 +127,24 @@ impl SlideApp {
         self
     }
 
-    /// Work the user would lose if the app went away now: a presentation with unsaved changes,
-    /// or typing the last pass drew that isn't in its presentation yet (a notes, outline,
-    /// SmartArt, comment, alt text or property field being edited), which a page's leave-page
-    /// guard counts too.
+    /// Work the user would lose if the app went away now: a presentation with unsaved changes, or
+    /// typing that isn't in its presentation yet, which a page's leave-page guard counts too. A
+    /// field the interface drops when it isn't drawn (an outline, SmartArt or property field)
+    /// counts while the last full pass drew it; typing the app keeps whether or not its pane is
+    /// drawn (a comment reply, alt text, speaker notes, the New Comment dialog) counts from where
+    /// it is kept.
     pub fn has_unsaved_work(&self) -> bool {
-        self.drafting || self.session.documents().iter().any(|d| d.is_dirty())
+        self.drafting
+            || self.session.documents().iter().any(|d| d.is_dirty())
+            || self.drafts.pending(&self.session)
+            || self.notes_edited()
+            || self.dialog.as_ref().is_some_and(dialogs::Dialog::has_draft)
+    }
+
+    /// The notes pane's draft was edited and its slide is still there to take it.
+    fn notes_edited(&self) -> bool {
+        let (doc, slide, draft) = &self.notes_buf;
+        draft.edited && drafts::slide_of(&self.session, *doc, *slide).is_some()
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
@@ -300,6 +313,8 @@ impl SlideApp {
         }
         // Drafts drawn in this pass say so again (a discarded pass above keeps the last answer).
         self.drafting = false;
+        // Drafts of a presentation that closed, and of what is gone since, go with it.
+        self.drafts.forget_stale(&self.session);
         let t0 = now_ms();
         let t = theme::Tokens::get(&ctx);
         self.note_ui_text(&ctx);

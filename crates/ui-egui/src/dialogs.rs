@@ -24,6 +24,11 @@ impl Dialog {
     pub fn modal(&self) -> bool {
         true
     }
+    /// Text typed and not entered yet: the New Comment dialog's. It counts as unsaved work
+    /// whether or not the dialog is drawn (a slide show covers a dialog without closing it).
+    pub(crate) fn has_draft(&self) -> bool {
+        self.id == "comment" && self.fields.get("text").is_some_and(|t| !t.trim().is_empty())
+    }
     fn get(&mut self, k: &str, default: &str) -> String {
         self.fields.entry(k.into()).or_insert_with(|| default.to_string()).clone()
     }

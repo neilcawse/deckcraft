@@ -50,6 +50,7 @@ pub use control::{ControlRequest, ControlResponse};
 
 mod app;
 mod clock;
+mod drafts;
 mod ime_hooks;
 pub mod panels;
 mod services;
@@ -310,9 +311,13 @@ pub struct SlideApp {
     /// Quit was confirmed (changes saved or discarded): let the window close.
     pub quit_confirmed: bool,
     pub(crate) notes_buf: (u64, usize, notes::Draft),
-    /// The last full pass drew typing not yet in a presentation (a notes, outline, SmartArt,
-    /// comment, alt text or property draft): see [`SlideApp::has_unsaved_work`].
+    /// The last full pass drew typing not yet in a presentation that the interface drops when it
+    /// isn't drawn (an outline, SmartArt or property field being edited). Drafts the app keeps
+    /// whether or not their pane is drawn count from their own state instead: see
+    /// [`SlideApp::has_unsaved_work`].
     pub(crate) drafting: bool,
+    /// Text typed in a pane (a comment reply, alt text, a Notes Page) and not entered yet.
+    pub(crate) drafts: drafts::Drafts,
     /// Faces borrowed from the font database for text the interface fonts can't draw (#101).
     pub ui_fonts: uifonts::UiFonts,
     /// Slide drag in the thumbnail pane or the Slide Sorter: the dragged slides and the drop gap.
