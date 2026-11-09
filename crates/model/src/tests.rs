@@ -1,7 +1,7 @@
 use super::{
-    ColorRef, Fill, LayoutType, Paragraph, PhType, Placeholder, Presentation, Run, RunProps, SchemeSlot, Shape, ShapeId, ShapeKind, ShapeStyle,
-    Slide, Table, TextBody, Theme, Xfrm, defaults, ink_pressure_is_legacy, ink_sample_width, parent_of, resolve, sibling_list_mut, style, text,
-    theme, walk,
+    ColorRef, Comment, Fill, LayoutType, Paragraph, PhType, Placeholder, Presentation, Run, RunProps, SchemeSlot, Shape, ShapeId, ShapeKind,
+    ShapeStyle, Slide, Table, TextBody, Theme, Xfrm, defaults, ink_pressure_is_legacy, ink_sample_width, parent_of, resolve, sibling_list_mut, style,
+    text, theme, walk,
 };
 use crate::resolve::Ctx;
 
@@ -340,4 +340,18 @@ fn colour_alpha_follows_alpha_mod_and_off() {
     assert!((off.alpha() - 0.5).abs() < 1e-9, "{}", off.alpha());
     let both = base().with(ColorTransform::Alpha(40000)).with(ColorTransform::AlphaMod(50000));
     assert!((both.alpha() - 0.2).abs() < 1e-9, "{}", both.alpha());
+}
+
+#[test]
+fn a_comment_is_told_by_a_number_that_is_not_part_of_what_it_says() {
+    let a = Comment { author: "Ada".into(), text: "Check the axis".into(), ..Default::default() };
+    assert_eq!(a.clone().id.get(), a.id.get(), "a copy of the presentation holds the same comment");
+    let b = Comment { author: "Ada".into(), text: "Check the axis".into(), ..Default::default() };
+    assert_ne!(b.id.get(), a.id.get(), "a comment made again is another comment");
+    assert_eq!(b, a, "comments with the same content are equal whatever their numbers");
+    let json = serde_json::to_string(&a).unwrap();
+    assert!(!json.contains("\"id\""), "the number is never saved: {json}");
+    let read: Vec<Comment> = serde_json::from_str(&format!("[{json},{json}]")).unwrap();
+    assert_ne!(read[0].id.get(), read[1].id.get(), "every comment read is its own");
+    assert!(read.iter().all(|c| c.id.get() != a.id.get()));
 }

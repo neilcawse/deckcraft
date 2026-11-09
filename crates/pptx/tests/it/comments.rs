@@ -29,6 +29,7 @@ fn deck() -> Presentation {
                 },
             ],
             shape: None,
+            ..Default::default()
         },
         Comment {
             author: "Bob".into(),
@@ -40,6 +41,7 @@ fn deck() -> Presentation {
             resolved: false,
             replies: vec![],
             shape: None,
+            ..Default::default()
         },
     ];
     p

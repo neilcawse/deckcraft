@@ -285,81 +285,120 @@ fn dlg_setup_show(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
     ok || cancel
 }
 
+/// What a person chose in the Save Changes question of Close and Quit.
+enum Answer {
+    DontSave,
+    Save,
+    Cancel,
+}
+
+/// The Save Changes question about `what` (a presentation, or how many). `saveable`: a Save would
+/// write something (changes, or typing it enters into the presentation). `unposted`: a reply typed
+/// under a comment waits, which no Save can enter (only posting does). A question that is only about
+/// replies has no Save: there is nothing to save, and Enter must not throw the reply away.
+fn save_changes_question(ui: &mut Ui, what: &str, saveable: bool, unposted: bool) -> Option<Answer> {
+    if saveable {
+        ui.label(egui::RichText::new(format!("Do you want to save the changes you made to {what}?")).strong());
+        ui.label("Your changes will be lost if you don't save them.");
+        if unposted {
+            ui.label("A reply you typed under a comment isn't posted, and saving doesn't post it.");
+        }
+    } else {
+        ui.label(egui::RichText::new(format!("There is a reply in {what} that isn't posted.")).strong());
+        ui.label("It will be lost if you don't post it.");
+    }
+    ui.add_space(8.0);
+    let mut answer = None;
+    ui.horizontal(|ui| {
+        let t = Tokens::get(ui.ctx());
+        if ui.add(egui::Button::new("Don't Save").min_size(vec2(84.0, 24.0))).clicked() {
+            answer = Some(Answer::DontSave);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if saveable {
+                let save = ui.add(egui::Button::new(egui::RichText::new("Save").color(t.accent_text)).fill(t.accent).min_size(vec2(72.0, 24.0)));
+                if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    answer = Some(Answer::Save);
+                }
+            }
+            if ui.add(egui::Button::new("Cancel").min_size(vec2(72.0, 24.0))).clicked() {
+                answer = Some(Answer::Cancel);
+            }
+        });
+    });
+    answer
+}
+
 fn dlg_quit(app: &mut SlideApp, ui: &mut Ui, _d: &mut Dialog) -> bool {
-    let names: Vec<String> = app.session.documents().iter().filter(|d| d.is_dirty()).map(|d| d.title()).collect();
+    // Window close with unsaved changes, or typing kept for a presentation that isn't in it yet.
+    let names: Vec<String> = app.session.documents().iter().filter(|d| app.document_has_unsaved_work(d.uid)).map(|d| d.title()).collect();
     if names.is_empty() {
         app.quit_confirmed = true;
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         return true;
     }
     let what = if names.len() == 1 { format!("“{}”", names[0]) } else { format!("{} presentations", names.len()) };
-    ui.label(egui::RichText::new(format!("Do you want to save the changes you made to {what}?")).strong());
-    ui.label("Your changes will be lost if you don't save them.");
-    ui.add_space(8.0);
-    let mut done = false;
-    ui.horizontal(|ui| {
-        let t = Tokens::get(ui.ctx());
-        if ui.add(egui::Button::new("Don't Save").min_size(vec2(84.0, 24.0))).clicked() {
+    let unposted = app.drafts.unposted(&app.session, None);
+    let saveable = !unposted || app.session.documents().iter().any(|d| app.document_needs_saving(d.uid));
+    match save_changes_question(ui, &what, saveable, unposted) {
+        None => false,
+        Some(Answer::Cancel) => true,
+        Some(Answer::DontSave) => {
             let _ = app.session.execute("file.recovery.discard", &json!({}));
             app.quit_confirmed = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            done = true;
+            true
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let save = ui.add(egui::Button::new(egui::RichText::new("Save").color(t.accent_text)).fill(t.accent).min_size(vec2(72.0, 24.0)));
-            if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if app.save_all() {
+        Some(Answer::Save) => {
+            if app.save_all() {
+                if app.drafts.pending(&app.session) {
+                    // The files are saved; a reply isn't in them, and quitting would lose it.
+                    app.set_status("Saved. A reply you typed isn't posted, so DeckCraft stays open: post it, or quit with Don't Save to discard it.");
+                } else {
                     app.quit_confirmed = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                done = true;
             }
-            if ui.add(egui::Button::new("Cancel").min_size(vec2(72.0, 24.0))).clicked() {
-                done = true;
-            }
-        });
-    });
-    done
+            true
+        }
+    }
 }
 
 fn dlg_close(app: &mut SlideApp, ui: &mut Ui, _d: &mut Dialog) -> bool {
-    // File › Close and Ctrl+W on a presentation with unsaved changes.
-    let Some(name) = app.session.active().map(|d| d.title()) else { return true };
-    ui.label(egui::RichText::new(format!("Do you want to save the changes you made to “{name}”?")).strong());
-    ui.label("Your changes will be lost if you don't save them.");
-    ui.add_space(8.0);
-    let mut done = false;
-    ui.horizontal(|ui| {
-        let t = Tokens::get(ui.ctx());
-        if ui.add(egui::Button::new("Don't Save").min_size(vec2(84.0, 24.0))).clicked() {
+    // File › Close and Ctrl+W on a presentation with unsaved changes, or typing kept for it that
+    // isn't in it yet.
+    let Some((uid, name)) = app.session.active().map(|d| (d.uid, d.title())) else { return true };
+    let unposted = app.drafts.unposted(&app.session, Some(uid));
+    let saveable = !unposted || app.document_needs_saving(uid);
+    match save_changes_question(ui, &format!("“{name}”"), saveable, unposted) {
+        None => false,
+        Some(Answer::Cancel) => true,
+        Some(Answer::DontSave) => {
             run(app, "file.close", json!({}));
-            done = true;
+            true
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let save = ui.add(egui::Button::new(egui::RichText::new("Save").color(t.accent_text)).fill(t.accent).min_size(vec2(72.0, 24.0)));
-            if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let handed = app.save();
-                let dirty = app.session.active().is_some_and(|d| d.is_dirty());
-                if app.services.host_save.is_some() && app.services.host_confirms_saves {
-                    // The host page marks the presentation saved once it has stored the file:
-                    // until then it stays open, and Close again closes it then.
-                    if !dirty {
-                        run(app, "file.close", json!({}));
-                    } else if handed {
-                        app.set_status("Waiting for the save to finish…");
-                    }
-                } else if !dirty || (handed && app.web_saves()) {
-                    // In the browser a save is a download: the presentation stays "unsaved".
+        Some(Answer::Save) => {
+            let handed = app.save();
+            let dirty = app.session.active().is_some_and(|d| d.is_dirty());
+            let confirms = app.services.host_save.is_some() && app.services.host_confirms_saves;
+            if confirms && dirty && handed {
+                // The host page marks the presentation saved once it has stored the file: until then
+                // it stays open, and Close again closes it then.
+                app.set_status("Waiting for the save to finish…");
+            }
+            // In the browser a save is a download: the presentation stays "unsaved".
+            let saved = if confirms { !dirty } else { !dirty || (handed && app.web_saves()) };
+            if saved {
+                if !app.drafts.pending_in(&app.session, uid) {
                     run(app, "file.close", json!({}));
+                } else if app.drafts.unposted(&app.session, Some(uid)) {
+                    // The file is saved; the reply isn't in it, and closing would lose it.
+                    app.set_status(format!("Saved. The reply you typed in “{name}” isn't posted, so it stays open: post it, or close it with Don't Save to discard the reply."));
                 }
-                done = true;
             }
-            if ui.add(egui::Button::new("Cancel").min_size(vec2(72.0, 24.0))).clicked() {
-                done = true;
-            }
-        });
-    });
-    done
+            true
+        }
+    }
 }
 
 fn dlg_comment(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {

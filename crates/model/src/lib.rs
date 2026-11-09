@@ -596,6 +596,40 @@ pub enum Background {
     },
 }
 
+/// Which comment this is while the presentation is open: a number made with the comment (or when a
+/// file is read), copied with it and never saved. Moving its slide, deleting its neighbours, undoing
+/// and redoing leave the number with the comment, so whatever is kept for a comment (a reply typed
+/// under it and not posted) can follow it. It is not part of what a comment says: comments with
+/// the same content are equal whatever their numbers.
+#[derive(Clone, Copy, Debug)]
+pub struct CommentId(u64);
+
+static NEXT_COMMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl CommentId {
+    /// A number no other comment has had in this process.
+    pub fn new() -> Self {
+        CommentId(NEXT_COMMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The number, to key what is kept for the comment (ids themselves never compare unequal).
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for CommentId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for CommentId {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Comment {
@@ -610,6 +644,9 @@ pub struct Comment {
     pub replies: Vec<Comment>,
     /// The shape the comment is attached to.
     pub shape: Option<ShapeId>,
+    /// Which comment this is while the presentation is open: not saved, made afresh when read.
+    #[serde(skip)]
+    pub id: CommentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

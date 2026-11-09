@@ -71,8 +71,9 @@ pub(super) fn comments(app: &mut SlideApp, ui: &mut Ui) {
         app.dialog = Some(crate::dialogs::Dialog::new("comment"));
     }
     ui.separator();
-    // Each comment with the owner of the reply typed under it: who it is, not where it is, so moving
-    // or deleting slides and comments neither loses a reply nor hands it to another comment.
+    // Each comment with the owner of the reply typed under it: the comment itself (the number it
+    // carries), not its place in the list, so moving or deleting slides and comments neither loses a
+    // reply nor hands it to another comment, identical ones included.
     let threads: Vec<(usize, Vec<deckcraft_model::Comment>, Vec<ReplyOwner>)> = app
         .session
         .active()
@@ -82,7 +83,7 @@ pub(super) fn comments(app: &mut SlideApp, ui: &mut Ui) {
                 .iter()
                 .enumerate()
                 .filter(|(_, sl)| !sl.comments.is_empty())
-                .map(|(i, sl)| (i, sl.comments.clone(), ReplyOwner::of_comments(st.uid, sl.id, &sl.comments)))
+                .map(|(i, sl)| (i, sl.comments.clone(), sl.comments.iter().map(|c| ReplyOwner::of(st.uid, sl.id, c)).collect()))
                 .collect()
         })
         .unwrap_or_default();
@@ -172,8 +173,10 @@ fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: 
                     let r = ui.add(egui::TextEdit::singleline(&mut txt).hint_text("Reply…").desired_width(ui.available_width()));
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !txt.trim().is_empty() {
                         focus_comment(app, slide, index);
-                        run(app, "comment.reply", json!({"index": index, "text": txt}));
-                        txt.clear();
+                        // The draft ends once the reply is posted; if it is refused it stays.
+                        if app.run("comment.reply", json!({"index": index, "text": txt})).is_ok() {
+                            txt.clear();
+                        }
                     }
                     app.drafts.set_reply(owner, txt);
                 });

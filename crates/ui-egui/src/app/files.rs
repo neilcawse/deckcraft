@@ -165,14 +165,17 @@ impl SlideApp {
     }
 
     /// File › Close and Ctrl+W: closes the active presentation, asking first when it has unsaved
-    /// changes (Save, Don't Save, Cancel), as PowerPoint does.
+    /// changes or typing that isn't in it yet (Save, Don't Save, Cancel), as PowerPoint does. Only
+    /// this presentation's work counts, not that of the others that are open.
     pub fn close_presentation(&mut self) {
-        match self.session.active() {
-            None => {}
-            Some(d) if d.is_dirty() => self.dialog = Some(dialogs::Dialog::new("close")),
-            Some(_) => {
-                let _ = self.run("file.close", json!({}));
-            }
+        let Some(uid) = self.session.active().map(|d| d.uid) else { return };
+        if self.dialog.as_ref().is_some_and(dialogs::Dialog::has_draft) {
+            // A comment being written would be lost with the dialog a question replaces.
+            self.set_status("Post or cancel the comment you are writing first.");
+        } else if self.document_has_unsaved_work(uid) {
+            self.dialog = Some(dialogs::Dialog::new("close"));
+        } else {
+            let _ = self.run("file.close", json!({}));
         }
     }
 
@@ -481,6 +484,7 @@ impl SlideApp {
     /// files and doesn't confirm them has saved the presentation once it has the file. Returns
     /// whether the file was written or handed over.
     fn save_presentation(&mut self, format: &str, save_as: bool) -> bool {
+        self.enter_drafts();
         let name = self.session.active().map(|d| d.title()).unwrap_or_else(|| "Presentation".into());
         let ext = if format == "pptx" { "pptx" } else { "deckcraft" };
         let suggested = format!("{name}.{ext}");
@@ -523,11 +527,12 @@ impl SlideApp {
     /// Save every presentation with unsaved changes (asking for a location where needed).
     /// Returns false if one wasn't saved (cancelled or failed).
     pub fn save_all(&mut self) -> bool {
-        let dirty: Vec<usize> = self.session.documents().iter().enumerate().filter(|(_, d)| d.is_dirty()).map(|(i, _)| i).collect();
-        for i in dirty {
+        let due: Vec<usize> =
+            self.session.documents().iter().enumerate().filter(|(_, d)| self.document_needs_saving(d.uid)).map(|(i, _)| i).collect();
+        for i in due {
             self.session.set_active(i);
             self.save();
-            if self.session.documents().get(i).is_some_and(|d| d.is_dirty()) {
+            if self.session.documents().get(i).is_some_and(|d| self.document_needs_saving(d.uid)) {
                 return false;
             }
         }
@@ -538,6 +543,9 @@ impl SlideApp {
     /// Save dialog on the desktop; on the web, a `.pptx` to the host page or the browser, as a
     /// Save, not a Save As). Returns whether the file was written or handed over.
     pub fn save(&mut self) -> bool {
+        // What was typed for the presentation and isn't in it yet (notes, Outline text, ...) goes in
+        // before it is written, wherever the panes that showed it are.
+        self.enter_drafts();
         if self.session.active().and_then(|d| d.path.clone()).is_some() {
             match self.session.execute("file.save", &json!({})) {
                 Ok(_) => {

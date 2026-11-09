@@ -2,7 +2,8 @@
 //! handed over with the presentation it was made from and whether it asked for a new file, a
 //! Save Changes prompt's Save doesn't lose a presentation the page hasn't stored yet, a repaired
 //! copy isn't offered as the file it came from, and typing not yet in a presentation counts as
-//! unsaved work, whether or not the pane it was typed in is drawn.
+//! unsaved work, whether or not the pane it was typed in is drawn: closing a presentation or the
+//! window asks about it, and a Save enters what it can (a reply can only be posted).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::cell::RefCell;
@@ -271,12 +272,12 @@ fn a_reply_draft_counts_as_unsaved_work_with_the_comments_pane_hidden() {
     app.run("comment.add", json!({"text": "Check the figures"})).unwrap();
     mark_saved(&mut app);
     app.run("view.pane", json!({"pane": "comments"})).unwrap();
-    // The comment the reply is typed under: told by who wrote it and what it says, which posting a
-    // reply doesn't change.
+    // The comment the reply is typed under: the comment itself, by the number it carries, which
+    // posting a reply doesn't change.
     let owner = {
         let st = app.session.active().unwrap();
         let slide = &st.doc.slides[0];
-        ReplyOwner::of_comments(st.uid, slide.id, &slide.comments).remove(0)
+        ReplyOwner::of(st.uid, slide.id, &slide.comments[0])
     };
     let mut h = harness(app);
     assert!(!h.state().has_unsaved_work());
@@ -447,4 +448,244 @@ fn smartart_text_being_typed_counts_as_unsaved_work_with_the_text_pane_hidden() 
     assert!(h.state().session.active().unwrap().is_dirty());
     mark_saved(h.state_mut());
     assert!(!h.state().has_unsaved_work(), "an entered line is no draft");
+}
+
+/// A saved presentation with one comment, in a page that keeps its files.
+fn commented_app(confirms: bool) -> (SlideApp, Handed) {
+    let (mut app, handed) = host_app(confirms);
+    app.run("file.new", json!({})).unwrap();
+    app.run("comment.add", json!({"text": "Check the figures"})).unwrap();
+    mark_saved(&mut app);
+    (app, handed)
+}
+
+/// Types a reply under the comment in the Comments pane, then hides the pane: nothing draws the
+/// reply, and it is not in the presentation.
+fn type_reply_and_hide_the_pane(h: &mut Harness<'_, SlideApp>) {
+    h.state_mut().run("view.pane", json!({"pane": "comments"})).unwrap();
+    h.run_steps(3);
+    field(h, Role::TextInput, "Reply…").click();
+    h.run_steps(1);
+    h.event(egui::Event::Text("Will do".into()));
+    h.run_steps(2);
+    h.state_mut().run("view.pane", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_all_by_role(Role::TextInput).all(|n| n.accesskit_node().data().placeholder() != Some("Reply…")), "the pane is not drawn");
+    assert!(h.state().has_unsaved_work(), "the typed reply would be lost");
+    assert!(!h.state().session.active().unwrap().is_dirty(), "it is not in the presentation");
+}
+
+/// Asks the app to close its window, as the window's close button does.
+fn request_window_close(h: &mut Harness<'_, SlideApp>) {
+    h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+    h.step();
+}
+
+fn dialog_id(h: &Harness<'_, SlideApp>) -> Option<String> {
+    h.state().dialog.as_ref().map(|d| d.id.clone())
+}
+
+/// File > Close and Ctrl+W ask first about a reply typed and not posted, though nothing in the
+/// presentation changed and the Comments pane is hidden. Only posting enters a reply, so the question
+/// has no Save: Enter doesn't answer it, Cancel keeps the reply, and Don't Save drops it with the
+/// presentation.
+#[test]
+fn closing_a_presentation_with_an_unposted_reply_asks_first() {
+    let (app, handed) = commented_app(true);
+    let mut h = harness(app);
+    type_reply_and_hide_the_pane(&mut h);
+
+    h.state_mut().close_presentation();
+    h.run_steps(3);
+    assert_eq!(dialog_id(&h).as_deref(), Some("close"), "closing asks");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().session.documents().len(), 1, "Enter neither closes nor saves: a Save can't post the reply");
+    assert!(handed.borrow().is_empty(), "no file was made");
+    assert!(h.state().has_unsaved_work());
+
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert_eq!(dialog_id(&h), None);
+    assert_eq!(h.state().session.documents().len(), 1);
+    assert!(h.state().has_unsaved_work(), "Cancel keeps the reply");
+
+    h.state_mut().close_presentation();
+    h.run_steps(3);
+    h.get_by_label("Don't Save").click();
+    h.run_steps(3);
+    assert!(h.state().session.documents().is_empty(), "Don't Save closes the presentation");
+    assert!(!h.state().has_unsaved_work(), "and the reply goes with it");
+}
+
+/// Closing a presentation asks about its own work only: a reply typed in another presentation is
+/// still protected, but is no reason to ask before closing this one.
+#[test]
+fn another_presentations_reply_does_not_make_closing_this_one_ask() {
+    let (app, _) = commented_app(true);
+    let first = app.session.active().unwrap().uid;
+    let mut h = harness(app);
+    type_reply_and_hide_the_pane(&mut h);
+    h.state_mut().run("file.new", json!({})).unwrap();
+    h.run_steps(3);
+    assert_ne!(h.state().session.active().unwrap().uid, first);
+
+    h.state_mut().close_presentation();
+    h.run_steps(3);
+    assert_eq!(dialog_id(&h), None, "nothing of the second presentation is unsaved");
+    let docs: Vec<u64> = h.state().session.documents().iter().map(|d| d.uid).collect();
+    assert_eq!(docs, [first], "the second is closed");
+    assert!(h.state().has_unsaved_work(), "the first one's reply is still protected");
+    h.state_mut().close_presentation();
+    h.run_steps(3);
+    assert_eq!(dialog_id(&h).as_deref(), Some("close"), "its own reply is asked about");
+}
+
+/// The question's Save writes a presentation that has changes as well as a reply, but it can't post
+/// the reply: the presentation stays open with it, and the status line says why.
+#[test]
+fn the_close_question_saves_but_keeps_a_presentation_open_for_its_unposted_reply() {
+    let (app, handed) = commented_app(false);
+    let uid = app.session.active().unwrap().uid;
+    let mut h = harness(app);
+    type_reply_and_hide_the_pane(&mut h);
+    h.state_mut().run("slide.new", json!({})).unwrap();
+    h.state_mut().close_presentation();
+    h.run_steps(3);
+    assert_eq!(dialog_id(&h).as_deref(), Some("close"));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(handed.borrow().iter().map(|h| h.2).collect::<Vec<_>>(), [uid], "the presentation was saved");
+    assert_eq!(h.state().session.documents().len(), 1, "but not closed: the file doesn't have the reply");
+    assert!(!h.state().session.active().unwrap().is_dirty());
+    assert!(h.state().has_unsaved_work(), "the reply is still protected");
+    assert!(status(&h).contains("isn't posted"), "{:?}", status(&h));
+}
+
+/// Closing the window asks first about a reply typed and not posted, though every presentation is
+/// saved and the Comments pane is hidden.
+#[test]
+fn closing_the_window_with_an_unposted_reply_asks_first() {
+    let (app, _) = commented_app(true);
+    let mut h = harness(app);
+    type_reply_and_hide_the_pane(&mut h);
+
+    request_window_close(&mut h);
+    h.run_steps(3);
+    assert_eq!(dialog_id(&h).as_deref(), Some("quit"), "the window doesn't close unasked");
+    assert!(!h.state().quit_confirmed);
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert!(dialog_id(&h).is_none() && !h.state().quit_confirmed);
+    assert!(h.state().has_unsaved_work(), "Cancel keeps the reply");
+
+    request_window_close(&mut h);
+    h.run_steps(3);
+    h.get_by_label("Don't Save").click();
+    h.run_steps(3);
+    assert!(h.state().quit_confirmed, "Don't Save lets the window close");
+}
+
+/// A comment being written is not replaced by a close question, which would lose its text: closing
+/// waits until the comment is posted or cancelled.
+#[test]
+fn a_comment_being_written_is_not_replaced_by_a_close_question() {
+    let (mut app, _) = host_app(true);
+    app.run("file.new", json!({})).unwrap();
+    app.run("slide.new", json!({})).unwrap();
+    let mut h = harness(app);
+    h.state_mut().run("app.dialog", json!({"id": "comment"})).unwrap();
+    h.run_steps(2);
+    h.state_mut().dialog.as_mut().unwrap().fields.insert("text".into(), "Check the figures".into());
+    h.run_steps(2);
+
+    h.state_mut().close_presentation();
+    h.run_steps(2);
+    assert_eq!(dialog_id(&h).as_deref(), Some("comment"), "the comment stays");
+    assert!(status(&h).contains("comment you are writing"), "{:?}", status(&h));
+    assert_eq!(h.state().session.documents().len(), 1);
+
+    request_window_close(&mut h);
+    h.run_steps(2);
+    assert_eq!(dialog_id(&h).as_deref(), Some("comment"), "the window doesn't close over it either");
+    assert!(!h.state().quit_confirmed);
+    assert!(h.state().has_unsaved_work(), "the typed comment is still there");
+}
+
+/// A Save makes the file with text typed for the presentation although the pane that holds it isn't
+/// drawn: the Outline's title is in the file, not only in the Outline's draft.
+#[test]
+fn saving_enters_text_typed_in_a_pane_that_is_not_drawn() {
+    let files: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let sink = Rc::clone(&files);
+    let services = Services {
+        host_save: Some(Box::new(move |s: &HostSave<'_>| {
+            sink.borrow_mut().push(s.bytes.to_vec());
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let mut app = SlideApp::new(Session::new(), services);
+    app.run("file.new", json!({})).unwrap();
+    mark_saved(&mut app);
+    app.run("view.outline", json!({})).unwrap();
+    let mut h = harness(app);
+    field(&h, Role::TextInput, "Slide title").click();
+    h.run_steps(1);
+    h.event(egui::Event::Text("Quarterly review".into()));
+    h.run_steps(2);
+    h.state_mut().run("view.normal", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().has_unsaved_work(), "the typed title would be lost");
+    assert!(!h.state().session.active().unwrap().is_dirty(), "it is only in the Outline's draft");
+
+    assert!(h.state_mut().save());
+    let files = files.borrow();
+    assert_eq!(files.len(), 1, "one file was handed over");
+    let saved = deckcraft_engine::cmd::file::open_presentation("Presentation1.pptx", &files[0]).unwrap();
+    assert_eq!(saved.slides[0].title(), "Quarterly review", "the file has the typed title");
+    assert!(!h.state().has_unsaved_work(), "nothing is left to lose");
+}
+
+/// Save All (the quit question's Save) reaches a presentation in the background too: text typed for
+/// it and not entered goes into the presentation, and into its file.
+#[test]
+fn saving_all_enters_text_typed_for_a_presentation_in_the_background() {
+    let (mut app, handed) = host_app(false);
+    app.run("file.new", json!({})).unwrap();
+    let first = app.session.active().unwrap().uid;
+    mark_saved(&mut app);
+    app.run("view.outline", json!({})).unwrap();
+    let mut h = harness(app);
+    field(&h, Role::TextInput, "Slide title").click();
+    h.run_steps(1);
+    h.event(egui::Event::Text("Quarterly review".into()));
+    h.run_steps(2);
+    h.state_mut().run("file.new", json!({})).unwrap();
+    h.run_steps(3);
+    assert_ne!(h.state().session.active().unwrap().uid, first, "another presentation is in front");
+    assert!(h.state().session.documents().iter().all(|d| !d.is_dirty()), "no presentation has unsaved changes");
+    assert!(h.state().has_unsaved_work(), "the first one's typed title would be lost");
+    assert!(h.state().document_has_unsaved_work(first) && h.state().document_needs_saving(first));
+
+    assert!(h.state_mut().save_all());
+    let saved = h.state().session.documents().iter().find(|d| d.uid == first).unwrap();
+    assert_eq!(saved.doc.slides[0].title(), "Quarterly review", "the title went into its presentation");
+    assert_eq!(handed.borrow().iter().map(|h| h.2).collect::<Vec<_>>(), [first], "and into its file");
+    assert!(!h.state().has_unsaved_work());
+}
+
+/// A Save makes the file without a reply typed and not posted: only posting enters a reply, so the
+/// presentation counts as saved while the reply goes on counting as unsaved work.
+#[test]
+fn saving_leaves_an_unposted_reply_protected() {
+    let (app, handed) = commented_app(false);
+    let mut h = harness(app);
+    type_reply_and_hide_the_pane(&mut h);
+    assert!(h.state_mut().save());
+    assert_eq!(handed.borrow().len(), 1);
+    assert!(!h.state().session.active().unwrap().is_dirty(), "the presentation is saved");
+    h.run_steps(2);
+    assert!(h.state().has_unsaved_work(), "the file has no reply");
+    assert!(!h.state().document_needs_saving(h.state().session.active().unwrap().uid), "a Save has nothing more to write");
 }

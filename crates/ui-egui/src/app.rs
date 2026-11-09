@@ -140,6 +140,20 @@ impl SlideApp {
             || self.dialog.as_ref().is_some_and(dialogs::Dialog::has_draft)
     }
 
+    /// [`Self::has_unsaved_work`] for the open presentation `uid` alone: it has unsaved changes, or
+    /// typing the app keeps for it (a reply, notes, alt text, Outline text, SmartArt lines) isn't in
+    /// it yet. What closing that presentation must ask about; the others' work is no part of it.
+    pub fn document_has_unsaved_work(&self, uid: u64) -> bool {
+        self.session.documents().iter().any(|d| d.uid == uid && d.is_dirty()) || self.drafts.pending_in(&self.session, uid)
+    }
+
+    /// Whether saving the open presentation `uid` would write something new: it has unsaved changes,
+    /// or typing a Save enters into it ([`Self::enter_drafts`]). A reply is not that: only posting
+    /// enters one, so a Save leaves it and it stays protected.
+    pub fn document_needs_saving(&self, uid: u64) -> bool {
+        self.session.documents().iter().any(|d| d.uid == uid && d.is_dirty()) || self.drafts.unentered(&self.session, Some(uid))
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), now_ms()));
     }
@@ -252,12 +266,19 @@ impl SlideApp {
         if !self.synthetic.is_empty() || !self.synthetic_next.is_empty() || self.synthetic_pending {
             ctx.request_repaint();
         }
-        // Closing the window with unsaved changes asks first.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed && self.session.documents().iter().any(|d| d.is_dirty()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.show = None;
-            if self.dialog.as_ref().is_none_or(|d| d.id != "quit") {
-                self.dialog = Some(dialogs::Dialog::new("quit"));
+        // Closing the window with unsaved changes asks first. That counts typing the app keeps for a
+        // presentation (a reply, notes, ...). A comment being written in its dialog can't be asked
+        // about by another dialog without losing it, so the dialog stays and the close waits.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
+            let writing = self.dialog.as_ref().is_some_and(dialogs::Dialog::has_draft);
+            if writing || self.session.documents().iter().any(|d| self.document_has_unsaved_work(d.uid)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show = None;
+                if writing {
+                    self.set_status("Post or cancel the comment you are writing first.");
+                } else if self.dialog.as_ref().is_none_or(|d| d.id != "quit") {
+                    self.dialog = Some(dialogs::Dialog::new("quit"));
+                }
             }
         }
         self.autosave_if_due(ctx);

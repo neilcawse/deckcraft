@@ -293,12 +293,11 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
                 app.squiggles.notes_menu = None;
                 draft.text = buf.clone();
                 deckcraft_model::edit::replace_text(&mut draft.body, &buf);
-                draft.edited = false;
-                let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
+                // Kept as a draft, still counting as unsaved work, if the presentation refuses it.
+                draft.edited = app.run("slide.notes", json!({"body": draft.body, "index": idx})).is_err();
             }
             if r.lost_focus() && draft.edited {
-                draft.edited = false;
-                let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
+                draft.edited = app.run("slide.notes", json!({"body": draft.body, "index": idx})).is_err();
             }
             // The app keeps a draft that is being edited or typed in, so an edit still counts as
             // unsaved work if this pane is hidden, and still goes to its own slide.

@@ -16,8 +16,8 @@ use std::sync::Arc;
 use deckcraft_geom::{Size, emu_to_pt};
 use deckcraft_model::text::TextBody;
 use deckcraft_model::{
-    Background, Comment, CustomShow, EmbeddedFont, Geom, HeaderFooter, Layout, LayoutId, LayoutType, Master, MasterId, MediaId, MediaItem, PhType,
-    Presentation, Properties, Section, ShowSettings, Slide, SlideId, defaults,
+    Background, Comment, CommentId, CustomShow, EmbeddedFont, Geom, HeaderFooter, Layout, LayoutId, LayoutType, Master, MasterId, MediaId, MediaItem,
+    PhType, Presentation, Properties, Section, ShowSettings, Slide, SlideId, defaults,
 };
 
 use crate::PptxError;
@@ -1332,6 +1332,7 @@ fn read_comments(pkg: &Package, pres: &Part, root: &El, modern: bool) -> Vec<Com
             resolved: e.attr("status") == Some("resolved"),
             replies,
             shape: None,
+            id: CommentId::new(),
         }
     }
     root.children_named("cm").take(10_000).map(|c| one(c, &authors, 0, scale)).collect()

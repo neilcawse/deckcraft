@@ -36,14 +36,20 @@ impl Draft {
     }
 }
 
-/// Saves the notes of presentation `doc` that were edited and not saved yet, each to the slide it
-/// was typed for (wherever that slide is by now), except those of the slide `typing` whose field has
-/// the focus. An edit left behind (the field lost focus, another slide was shown, or the pane was
-/// hidden first) goes in as the focus leaving the field would have put it.
+/// Enters the notes of presentation `doc` that were edited and not entered yet, each into the slide
+/// it was typed for (wherever that slide is by now), except those of the slide `typing` whose field
+/// has the focus. An edit left behind (the field lost focus, another slide was shown, or the pane
+/// was hidden first) goes in as the focus leaving the field would have put it. The draft goes once
+/// the slide has the notes: when the presentation refuses them it stays, and goes on counting as
+/// unsaved work. Commands run on the active presentation, so `doc` must be that one.
 pub(crate) fn enter_edits(app: &mut crate::SlideApp, doc: u64, typing: Option<deckcraft_model::SlideId>) {
-    for (slide, body) in app.drafts.take_notes_edits(&app.session, doc, typing) {
-        if let Some(index) = crate::drafts::slide_index(&app.session, doc, slide) {
-            let _ = app.run("slide.notes", serde_json::json!({"body": body, "index": index}));
+    if app.session.active().map(|d| d.uid) != Some(doc) {
+        return;
+    }
+    for (slide, body) in app.drafts.notes_to_enter(&app.session, doc, typing) {
+        let Some(index) = crate::drafts::slide_index(&app.session, doc, slide) else { continue };
+        if app.run("slide.notes", serde_json::json!({"body": body, "index": index})).is_ok() {
+            app.drafts.drop_notes(doc, slide);
         }
     }
 }

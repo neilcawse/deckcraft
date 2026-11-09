@@ -420,8 +420,8 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
     .response
     .response;
     if r.lost_focus() && draft.edited {
-        draft.edited = false;
-        let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
+        // Kept as a draft, still counting as unsaved work, if the presentation refuses it.
+        draft.edited = app.run("slide.notes", json!({"body": draft.body, "index": idx})).is_err();
     }
     if let Some(s) = sid {
         if draft.edited || child.ctx().memory(|m| m.has_focus(edit_id)) {
@@ -509,11 +509,14 @@ fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deck
         if resp.gained_focus() {
             let _ = app.run("slide.go", json!({"index": i}));
         }
-        if let (Some(owner), Some(shape)) = (owner, title_shape) {
+        if let Some(owner) = owner {
             if !ui.ctx().memory(|m| m.has_focus(resp.id)) && v != cur_title {
-                // The focus left the field, or it was typed in before the Outline was hidden.
-                let _ = app.run("text.set", json!({"id": shape.0, "text": v}));
-                app.drafts.drop_text(&owner);
+                // The focus left the field, or it was typed in before the Outline was hidden: it goes
+                // into the title it was typed for, whichever slide is current by now. The draft goes
+                // once the title has the text; if the presentation refuses it, it stays and counts.
+                if !app.enter_text(&owner, &v) {
+                    app.drafts.set_text(owner, &cur_title, v);
+                }
             } else {
                 app.drafts.set_text(owner, &cur_title, v);
             }
@@ -535,9 +538,10 @@ fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deck
                 let _ = app.run("slide.go", json!({"index": i}));
             }
             if !ui.ctx().memory(|m| m.has_focus(resp.id)) && v != cur_text {
-                // The focus left the field, or it was typed in before the Outline was hidden.
-                let _ = app.run("text.set", json!({"id": sh.id.0, "text": v}));
-                app.drafts.drop_text(&owner);
+                // As for the title: into the shape it was typed for, kept (and counted) if refused.
+                if !app.enter_text(&owner, &v) {
+                    app.drafts.set_text(owner, &cur_text, v);
+                }
             } else {
                 app.drafts.set_text(owner, &cur_text, v);
             }

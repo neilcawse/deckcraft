@@ -3,18 +3,21 @@
 //! show) while the text stays and comes back with the pane, so it counts as unsaved work
 //! ([`SlideApp::has_unsaved_work`](crate::SlideApp::has_unsaved_work)) whether or not anything draws
 //! it. A draft belongs to what it was typed for, never to a place in a list: a slide is told by its
-//! id, a comment by who wrote it, when and what, a shape by its id, a master or layout by its id. So
+//! id, a comment by the number it carries, a shape by its id, a master or layout by its id. So
 //! moving, deleting or undoing slides and comments neither moves a draft to another one nor loses
 //! it, and a draft goes when its presentation closes or what it was typed for is gone or changed.
 //! The pane that draws a draft enters it into the presentation the next time the field is drawn
-//! without the focus, as leaving the field would have.
+//! without the focus, as leaving the field would have, into the slide it was typed for whichever
+//! slide is current. A Save enters what a pane that isn't drawn still holds. A reply is the one
+//! draft that only posting enters: it stays, and keeps its presentation from closing unasked.
 
 use std::collections::HashMap;
 
-use deckcraft_engine::{DocState, Session, Target};
+use deckcraft_engine::{DocState, Selection, Session, Target};
 use deckcraft_model::{Comment, LayoutId, MasterId, Presentation, Shape, ShapeId, Slide, SlideId, TextBody};
+use serde_json::{Value, json};
 
-use crate::notes;
+use crate::{SlideApp, notes};
 
 /// The open presentation `doc`.
 fn document(session: &Session, doc: u64) -> Option<&DocState> {
@@ -87,66 +90,59 @@ impl Tree {
             Tree::NotesMaster => doc.notes_master.as_ref().map(|m| m.shapes.as_slice()),
         }
     }
-}
 
-/// A comment, told from the others on its slide by who wrote it, when and what it says, never by
-/// where it is in the list. Comments have no id, so identical ones (same author, date and text) are
-/// told apart by their order among the identical, and only while there are as many of them as when
-/// the key was made: once one is added or removed the order says nothing about which is which, and a
-/// reply typed under one of them is gone rather than handed to another.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CommentKey {
-    author: String,
-    date: String,
-    text: String,
-    /// How many comments before it are identical.
-    nth: usize,
-    /// How many comments are identical to it, itself included.
-    of: usize,
-}
-
-impl CommentKey {
-    fn is(&self, c: &Comment) -> bool {
-        c.author == self.author && c.date == self.date && c.text == self.text
+    /// Points `sel` at this tree of `doc`, to edit its shapes: the slide or the master, layout or page
+    /// master, with no shape selected. False when the tree is gone.
+    fn point(self, doc: &Presentation, sel: &mut Selection) -> bool {
+        let target = match self {
+            Tree::Slide(id) => {
+                let Some(index) = doc.slide_index(id) else { return false };
+                sel.slide = index;
+                Target::Slides
+            }
+            Tree::Master(id) => match doc.masters.iter().position(|m| m.id == id) {
+                Some(master) => Target::Master { master },
+                None => return false,
+            },
+            Tree::Layout(master, layout) => {
+                let Some((mi, m)) = doc.masters.iter().enumerate().find(|(_, m)| m.id == master) else { return false };
+                let Some(li) = m.layouts.iter().position(|l| l.id == layout) else { return false };
+                Target::Layout { master: mi, layout: li }
+            }
+            Tree::Handout if doc.handout_master.is_some() => Target::Handout,
+            Tree::NotesMaster if doc.notes_master.is_some() => Target::NotesMaster,
+            Tree::Handout | Tree::NotesMaster => return false,
+        };
+        sel.target = target;
+        sel.shapes.clear();
+        sel.text = None;
+        sel.cells = None;
+        true
     }
-
-    /// Whether the comment is among `comments` still, and nothing identical came or went since.
-    fn exists_in(&self, comments: &[Comment]) -> bool {
-        comments.iter().filter(|c| self.is(c)).count() == self.of
-    }
 }
 
-/// The comment a reply is typed under.
+/// The comment a reply is typed under: the comment itself, told by its [`CommentId`] and its slide,
+/// never by where it is in the list or by what it says. The id stays with the comment when its slide
+/// moves, when the comments around it are deleted and when the deck is undone, and comments that say
+/// the same thing (a note imported twice) each have their own.
+///
+/// [`CommentId`]: deckcraft_model::CommentId
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ReplyOwner {
     doc: u64,
     slide: SlideId,
-    comment: CommentKey,
+    comment: u64,
 }
 
 impl ReplyOwner {
-    /// The owner of each of `comments`, in order: those of slide `slide` of the open presentation `doc`.
-    pub(crate) fn of_comments(doc: u64, slide: SlideId, comments: &[Comment]) -> Vec<ReplyOwner> {
-        let mut totals: HashMap<(&str, &str, &str), usize> = HashMap::new();
-        for c in comments {
-            *totals.entry((&c.author, &c.date, &c.text)).or_default() += 1;
-        }
-        let mut seen: HashMap<(&str, &str, &str), usize> = HashMap::new();
-        comments
-            .iter()
-            .map(|c| {
-                let key = (c.author.as_str(), c.date.as_str(), c.text.as_str());
-                let nth = seen.entry(key).or_default();
-                let of = totals.get(&key).copied().unwrap_or(1);
-                let comment = CommentKey { author: c.author.clone(), date: c.date.clone(), text: c.text.clone(), nth: *nth, of };
-                *nth += 1;
-                ReplyOwner { doc, slide, comment }
-            })
-            .collect()
+    /// The owner of `comment`, which is on slide `slide` of the open presentation `doc`.
+    pub(crate) fn of(doc: u64, slide: SlideId, comment: &Comment) -> ReplyOwner {
+        ReplyOwner { doc, slide, comment: comment.id.get() }
     }
 
+    /// Whether the comment is still on its slide.
     fn exists(&self, session: &Session) -> bool {
-        slide_of(session, self.doc, self.slide).is_some_and(|s| self.comment.exists_in(&s.comments))
+        slide_of(session, self.doc, self.slide).is_some_and(|s| s.comments.iter().any(|c| c.id.get() == self.comment))
     }
 }
 
@@ -195,11 +191,21 @@ impl TextOwner {
             Field::OutlineBody => shapes.iter().find(|s| s.id == self.shape && !is_title(s)).and_then(|s| s.text.as_ref()).map(outline_body),
         }
     }
+
+    /// The command that puts `typed` into the field, with its parameters. They name the shape, so they
+    /// hold wherever the selection is as long as the editing is pointed at the field's shapes
+    /// ([`SlideApp::run_in`]).
+    fn enter_command(&self, typed: &str) -> (&'static str, Value) {
+        match self.field {
+            Field::AltText => ("shape.altText", json!({"text": typed, "ids": [self.shape.0]})),
+            Field::OutlineTitle | Field::OutlineBody => ("text.set", json!({"id": self.shape.0, "text": typed})),
+        }
+    }
 }
 
 /// The text of each node of SmartArt graphic `group` among the shapes of `tree` in the open
 /// presentation `doc`, as the Text Pane shows it.
-fn smartart_texts(session: &Session, doc: u64, tree: Tree, group: ShapeId) -> Option<Vec<String>> {
+pub(crate) fn smartart_texts(session: &Session, doc: u64, tree: Tree, group: ShapeId) -> Option<Vec<String>> {
     deckcraft_engine::cmd::smartart::node_texts(tree.shapes(&document(session, doc)?.doc)?, group)
 }
 
@@ -303,17 +309,38 @@ impl Drafts {
         self.notes.get(&(doc, slide)).map(|(_, draft)| draft.text.clone())
     }
 
-    /// Takes the notes edited and not entered in presentation `doc`, except those of the slide
-    /// `typing` whose field is being typed in, as (slide, notes). A draft made from notes the slide
-    /// no longer has is dropped instead.
-    pub(crate) fn take_notes_edits(&mut self, session: &Session, doc: u64, typing: Option<SlideId>) -> Vec<(SlideId, TextBody)> {
-        let edited: Vec<SlideId> =
-            self.notes.iter().filter_map(|(&(d, s), (_, draft))| (d == doc && draft.edited && Some(s) != typing).then_some(s)).collect();
-        edited
-            .into_iter()
-            .filter_map(|slide| {
-                let (base, draft) = self.notes.remove(&(doc, slide))?;
-                notes_are(session, doc, slide, &base).then_some((slide, draft.body))
+    /// The notes edited and not entered in presentation `doc`, except those of the slide `typing`
+    /// whose field is being typed in, as (slide, notes). A draft made from notes the slide no longer
+    /// has is not among them ([`Self::forget_stale`] drops it).
+    pub(crate) fn notes_to_enter(&self, session: &Session, doc: u64, typing: Option<SlideId>) -> Vec<(SlideId, TextBody)> {
+        self.notes
+            .iter()
+            .filter(|&(&(d, s), (base, draft))| d == doc && draft.edited && Some(s) != typing && notes_are(session, d, s, base))
+            .map(|(&(_, s), (_, draft))| (s, draft.body.clone()))
+            .collect()
+    }
+
+    /// The text typed into fields of presentation `doc` that is not in their shapes, as (field, text):
+    /// the drafts whose shape still has the text they started from.
+    pub(crate) fn texts_to_enter(&self, session: &Session, doc: u64) -> Vec<(TextOwner, String)> {
+        self.texts
+            .iter()
+            .filter(|&(o, (base, typed))| o.doc == doc && typed != base && o.current(session).is_some_and(|now| now == *base))
+            .map(|(o, (_, typed))| (o.clone(), typed.clone()))
+            .collect()
+    }
+
+    /// The Text Pane lines of presentation `doc` that differ from their graphic's nodes, as (shapes,
+    /// graphic, (node, line) of each node that differs).
+    pub(crate) fn smartart_to_enter(&self, session: &Session, doc: u64) -> Vec<(Tree, ShapeId, Vec<(usize, String)>)> {
+        self.smartart
+            .iter()
+            .filter(|&(&(d, tree, group), (base, lines))| {
+                d == doc && lines != base && smartart_texts(session, d, tree, group).is_some_and(|now| now == *base)
+            })
+            .map(|(&(_, tree, group), (base, lines))| {
+                let changed = lines.iter().enumerate().filter(|&(i, line)| base.get(i) != Some(line)).map(|(i, line)| (i, line.clone())).collect();
+                (tree, group, changed)
             })
             .collect()
     }
@@ -330,12 +357,102 @@ impl Drafts {
     /// Whether anything typed and not entered waits in an open presentation: a reply that is not
     /// blank, text that differs from the shape's, Text Pane lines or notes that were edited.
     pub(crate) fn pending(&self, session: &Session) -> bool {
-        self.replies.iter().any(|(owner, text)| !text.trim().is_empty() && owner.exists(session))
-            || self.texts.iter().any(|(owner, (base, typed))| typed != base && owner.current(session).is_some_and(|now| now == *base))
+        self.unposted(session, None) || self.unentered(session, None)
+    }
+
+    /// [`Self::pending`] for the open presentation `doc` alone.
+    pub(crate) fn pending_in(&self, session: &Session, doc: u64) -> bool {
+        self.unposted(session, Some(doc)) || self.unentered(session, Some(doc))
+    }
+
+    /// Whether a reply that is not blank waits under a comment that is still there, in the open
+    /// presentation `only` (any when none). Only posting enters a reply: a Save leaves it, so it
+    /// stays protected until it is posted or thrown away.
+    pub(crate) fn unposted(&self, session: &Session, only: Option<u64>) -> bool {
+        self.replies.iter().any(|(owner, text)| only.is_none_or(|doc| doc == owner.doc) && !text.trim().is_empty() && owner.exists(session))
+    }
+
+    /// Whether text waits to go into its shape, Text Pane lines into their graphic or notes into
+    /// their slide, in the open presentation `only` (any when none): what a Save enters
+    /// ([`SlideApp::enter_drafts`]) before it writes the file.
+    pub(crate) fn unentered(&self, session: &Session, only: Option<u64>) -> bool {
+        let wanted = |doc: u64| only.is_none_or(|only| only == doc);
+        self.texts.iter().any(|(owner, (base, typed))| wanted(owner.doc) && typed != base && owner.current(session).is_some_and(|now| now == *base))
             || self.smartart.iter().any(|(&(doc, tree, group), (base, lines))| {
-                lines != base && smartart_texts(session, doc, tree, group).is_some_and(|now| now == *base)
+                wanted(doc) && lines != base && smartart_texts(session, doc, tree, group).is_some_and(|now| now == *base)
             })
-            || self.notes.iter().any(|(&(doc, slide), (base, draft))| draft.edited && notes_are(session, doc, slide, base))
+            || self.notes.iter().any(|(&(doc, slide), (base, draft))| wanted(doc) && draft.edited && notes_are(session, doc, slide, base))
+    }
+}
+
+impl SlideApp {
+    /// Runs command `id` with the editing pointed at `tree` of the active presentation, wherever it is
+    /// now: a command that names its shape still looks for it on the slide, master or layout the
+    /// selection is on. The selection goes back afterwards, so a draft entered from elsewhere (the
+    /// Outline with another slide current, a Save) neither moves the person nor needs the shape to
+    /// be selected.
+    pub(crate) fn run_in(&mut self, tree: Tree, id: &str, params: Value) -> Result<Value, String> {
+        let Some(st) = self.session.active() else { return Err("no presentation is open".into()) };
+        if Tree::of(st) == Some(tree) {
+            return self.run(id, params);
+        }
+        let before = st.selection.clone();
+        let mut pointed = before.clone();
+        if !tree.point(&st.doc, &mut pointed) {
+            return Err("what the text was typed for is gone".into());
+        }
+        self.session.select(|_, sel| *sel = pointed).map_err(|e| e.to_string())?;
+        let result = self.run(id, params);
+        let _ = self.session.select(|_, sel| *sel = before);
+        result
+    }
+
+    /// Puts `typed`, the text of `owner`'s field, into the shape it was typed for, wherever the editing
+    /// is now. The draft goes once the presentation has taken the text; when the presentation refuses it
+    /// (the status line says why) the draft stays, and the field goes on counting as unsaved work.
+    /// Whether the text went in.
+    pub(crate) fn enter_text(&mut self, owner: &TextOwner, typed: &str) -> bool {
+        if self.session.active().map(|d| d.uid) != Some(owner.doc) {
+            return false;
+        }
+        let (id, params) = owner.enter_command(typed);
+        let entered = self.run_in(owner.tree, id, params).is_ok();
+        if entered {
+            self.drafts.drop_text(owner);
+        }
+        entered
+    }
+
+    /// Puts the Text Pane lines typed for SmartArt graphic `group` of `tree`, as (node, line), into
+    /// it, wherever the editing is now. The draft goes once every line has gone in; when the
+    /// presentation refuses one (the status line says why) the draft stays, and the lines go on
+    /// counting as unsaved work. Whether every line went in.
+    pub(crate) fn enter_lines(&mut self, doc: u64, tree: Tree, group: ShapeId, lines: &[(usize, String)]) -> bool {
+        if self.session.active().map(|d| d.uid) != Some(doc) {
+            return false;
+        }
+        let mut entered = true;
+        for (index, text) in lines {
+            entered &= self.run_in(tree, "smartArt.setNodes", json!({"id": group.0, "index": index, "text": text})).is_ok();
+        }
+        if entered {
+            self.drafts.drop_smartart(doc, tree, group);
+        }
+        entered
+    }
+
+    /// Enters into the active presentation everything typed for it and not entered yet that can be
+    /// entered, whether or not the panes that showed it are drawn now: what a Save would otherwise
+    /// leave out. A reply stays, as only posting enters one.
+    pub(crate) fn enter_drafts(&mut self) {
+        let Some(doc) = self.session.active().map(|d| d.uid) else { return };
+        for (owner, typed) in self.drafts.texts_to_enter(&self.session, doc) {
+            self.enter_text(&owner, &typed);
+        }
+        for (tree, group, lines) in self.drafts.smartart_to_enter(&self.session, doc) {
+            self.enter_lines(doc, tree, group, &lines);
+        }
+        notes::enter_edits(self, doc, None);
     }
 }
 
@@ -360,7 +477,7 @@ mod tests {
     fn owner(s: &Session, slide: usize, index: usize) -> ReplyOwner {
         let st = s.active().unwrap();
         let sl = &st.doc.slides[slide];
-        ReplyOwner::of_comments(st.uid, sl.id, &sl.comments).into_iter().nth(index).unwrap()
+        ReplyOwner::of(st.uid, sl.id, &sl.comments[index])
     }
 
     /// A presentation with `n` comments on its first slide.
@@ -427,7 +544,9 @@ mod tests {
         assert_eq!(d.reply(&other), "For the other");
     }
 
-    /// Comments that are identical but for their place are told apart by their order.
+    /// Comments that say the same are told apart by the number each carries, not by their order or
+    /// their words: a reply stays with its own comment when the one before it goes, and when that
+    /// deletion is undone.
     #[test]
     fn identical_comments_have_their_own_replies() {
         let mut s = Session::with_new();
@@ -435,11 +554,12 @@ mod tests {
             s.execute("comment.add", &json!({"text": "Same", "x": 1.0, "y": 1.0})).unwrap();
         }
         // Dates are to the second; make sure the two are identical.
-        let (uid, slides) = ids(&s);
         let mut doc = (*s.active().unwrap().doc).clone();
         let date = doc.slides[0].comments[0].date.clone();
         std::sync::Arc::make_mut(&mut doc.slides[0]).comments[1].date = date;
         s.active_mut().unwrap().doc = std::sync::Arc::new(doc);
+        let comments = &s.active().unwrap().doc.slides[0].comments;
+        assert_eq!(comments[0], comments[1], "nothing they say tells them apart");
         let (first, second) = (owner(&s, 0, 0), owner(&s, 0, 1));
         assert_ne!(first, second);
         let mut d = Drafts::default();
@@ -447,7 +567,39 @@ mod tests {
         assert_eq!(d.reply(&first), "");
         assert_eq!(d.reply(&second), "For the second");
         assert!(d.pending(&s));
-        assert_eq!((uid, slides.len()), (uid, 1));
+
+        // The first goes: the second is the only comment left, and keeps its reply.
+        s.execute("comment.delete", &json!({"index": 0})).unwrap();
+        d.forget_stale(&s);
+        assert_eq!(d.reply(&owner(&s, 0, 0)), "For the second", "the same comment, now first in the list");
+        assert_eq!(d.reply(&first), "");
+        assert!(d.pending(&s));
+
+        // Undoing brings the first back as the comment it was, with no reply; the second keeps its own.
+        s.execute("edit.undo", &json!({})).unwrap();
+        d.forget_stale(&s);
+        assert_eq!((owner(&s, 0, 0), owner(&s, 0, 1)), (first, second.clone()), "an undo gives the comments back as they were");
+        assert_eq!(d.reply(&second), "For the second");
+        assert!(d.pending(&s));
+    }
+
+    /// A reply waits to be posted and no Save enters it; typed text waits to be entered and a Save
+    /// does. Both are counted for their own presentation only.
+    #[test]
+    fn a_reply_is_unposted_and_typed_text_is_unentered_each_in_its_own_presentation() {
+        let mut s = commented(1);
+        let (uid, _) = ids(&s);
+        let mut d = Drafts::default();
+        d.set_reply(owner(&s, 0, 0), "Will do".into());
+        assert!(d.unposted(&s, None) && !d.unentered(&s, None), "a Save can't enter a reply");
+        assert!(d.unposted(&s, Some(uid)) && !d.unposted(&s, Some(uid + 1)), "it waits in its own presentation only");
+        assert!(d.pending_in(&s, uid) && !d.pending_in(&s, uid + 1));
+
+        s.execute("insert.textBox", &json!({"text": "Hello"})).unwrap();
+        let (field, _) = alt_field(&s);
+        d.set_text(field, "", "A greeting".into());
+        assert!(d.unentered(&s, None) && d.unentered(&s, Some(uid)) && !d.unentered(&s, Some(uid + 1)));
+        assert!(d.pending_in(&s, uid));
     }
 
     #[test]
@@ -611,9 +763,9 @@ mod tests {
         assert!(d.notes.is_empty());
     }
 
-    /// Edited notes are taken for the slide they were typed for, wherever it is by then.
+    /// Edited notes are entered for the slide they were typed for, wherever it is by then.
     #[test]
-    fn edited_notes_are_taken_for_their_slide_not_the_place_it_had() {
+    fn edited_notes_are_entered_for_their_slide_not_the_place_it_had() {
         let mut s = Session::with_new();
         s.execute("slide.new", &json!({})).unwrap();
         let (uid, slides) = ids(&s);
@@ -627,10 +779,11 @@ mod tests {
         d.keep_notes(uid, slides[0], base.clone(), draft);
         s.execute("slide.move", &json!({"from": 0, "to": 1})).unwrap();
         assert!(d.pending(&s));
-        assert!(d.take_notes_edits(&s, uid, Some(slides[0])).is_empty(), "its field is being typed in");
-        let taken = d.take_notes_edits(&s, uid, None);
-        assert_eq!(taken, vec![(slides[0], typed)]);
+        assert!(d.notes_to_enter(&s, uid, Some(slides[0])).is_empty(), "its field is being typed in");
+        assert_eq!(d.notes_to_enter(&s, uid, None), vec![(slides[0], typed)]);
         assert_eq!(super::slide_index(&s, uid, slides[0]), Some(1), "the slide the notes belong to moved");
+        assert!(d.pending(&s), "they wait until the slide has them");
+        d.drop_notes(uid, slides[0]);
         assert!(d.notes.is_empty() && !d.pending(&s));
     }
 }

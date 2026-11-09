@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use deckcraft_model::Comment;
+use deckcraft_model::{Comment, CommentId};
 use serde_json::{Value, json};
 
 use super::{
@@ -136,7 +136,18 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit(|doc, sel| {
         let sl = Arc::make_mut(doc.slides.get_mut(sel.slide).ok_or_else(|| bad("comment.add", "no slide"))?);
         let initials: String = author.split_whitespace().filter_map(|w| w.chars().next()).collect();
-        sl.comments.push(Comment { author: author.clone(), initials, text, date: now(), x, y, resolved: false, replies: vec![], shape });
+        sl.comments.push(Comment {
+            author: author.clone(),
+            initials,
+            text,
+            date: now(),
+            x,
+            y,
+            resolved: false,
+            replies: vec![],
+            shape,
+            id: CommentId::new(),
+        });
         Ok(json!({"index": sl.comments.len() - 1}))
     })
 }
