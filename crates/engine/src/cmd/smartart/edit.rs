@@ -23,15 +23,28 @@ fn diagram_group(shapes: &[Shape], id: ShapeId) -> Option<&Shape> {
     None
 }
 
-/// The SmartArt graphic the selection is (or is inside), with its outline as the Text Pane shows it.
-pub fn selected(st: &crate::DocState) -> Option<(ShapeId, Diagram)> {
-    let shapes = current_shapes(&st.doc, &st.selection)?;
-    let g = st.selection.shapes.iter().find_map(|id| diagram_group(shapes, *id))?;
+/// The outline of SmartArt graphic `g` as the Text Pane shows it: the text typed into its shapes
+/// read back into the nodes.
+fn outline(g: &Shape) -> Option<Diagram> {
     let mut d = g.diagram.clone()?;
     if let ShapeKind::Group { children, .. } = &g.kind {
         sync_text(&mut d, children);
     }
-    Some((g.id, d))
+    Some(d)
+}
+
+/// The SmartArt graphic the selection is (or is inside), with its outline as the Text Pane shows it.
+pub fn selected(st: &crate::DocState) -> Option<(ShapeId, Diagram)> {
+    let shapes = current_shapes(&st.doc, &st.selection)?;
+    let g = st.selection.shapes.iter().find_map(|id| diagram_group(shapes, *id))?;
+    Some((g.id, outline(g)?))
+}
+
+/// The text of each node of the SmartArt graphic that `id` is (or is inside) among `shapes`, as
+/// the Text Pane shows it.
+pub fn node_texts(shapes: &[Shape], id: ShapeId) -> Option<Vec<String>> {
+    let d = outline(diagram_group(shapes, id)?)?;
+    Some(d.nodes.into_iter().map(|n| n.text).collect())
 }
 
 fn target_group(s: &Session, p: &Value, cmd: &str) -> Result<ShapeId> {

@@ -1,5 +1,6 @@
 use super::effect_presets;
 use super::{Fill, Icon, ShapeKind, SlideApp, Tokens, Ui, color_button, cref_param, json, run, scheme, theme, vec2, widgets};
+use crate::drafts::{TextOwner, Tree};
 
 /// Percent transparency (0 = opaque) of a solid fill, the same number `shape.fill`'s
 /// `transparency` parameter writes as an alpha transform. Anything else (no fill, a
@@ -245,14 +246,17 @@ fn size_tab(app: &mut SlideApp, ui: &mut Ui, sh: &deckcraft_model::Shape, x: dec
     ui.add_space(6.0);
     ui.label(egui::RichText::new("Alt Text").font(theme::bold(13.0)));
     // The draft is the app's, not egui's temporary data: it is still there when this pane, tab or
-    // shape is shown again, and it counts as unsaved work meanwhile.
-    let slide = app.session.active().map_or(0, |st| st.selection.slide);
-    let mut alt = widgets::text_draft(app.drafts.alt_text(uid, slide, sh.id), &sh.descr);
+    // shape is shown again, and it counts as unsaved work meanwhile. It is the shape's (on its slide,
+    // master or layout), not that of whatever is at a place in the deck.
+    let owner = app.session.active().and_then(Tree::of).map(|tree| TextOwner::alt_text(uid, tree, sh.id));
+    let mut alt = widgets::text_draft(owner.as_ref().and_then(|o| app.drafts.text(o)), &sh.descr);
     let r = ui.add(egui::TextEdit::multiline(&mut alt).hint_text("Alt text").desired_rows(3).desired_width(f32::INFINITY));
     if r.lost_focus() && alt != sh.descr {
         run(app, "shape.altText", json!({"text": alt}));
     }
-    app.drafts.set_alt_text(uid, slide, sh.id, &sh.descr, alt);
+    if let Some(owner) = owner {
+        app.drafts.set_text(owner, &sh.descr, alt);
+    }
 }
 
 /// Render the shape-format pane with fill/line, effects, size/properties, text, and picture tabs.

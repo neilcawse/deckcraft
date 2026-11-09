@@ -310,13 +310,12 @@ pub struct SlideApp {
     pub last_recovery: f64,
     /// Quit was confirmed (changes saved or discarded): let the window close.
     pub quit_confirmed: bool,
-    pub(crate) notes_buf: (u64, usize, notes::Draft),
     /// The last full pass drew typing not yet in a presentation that the interface drops when it
-    /// isn't drawn (an outline, SmartArt or property field being edited). Drafts the app keeps
-    /// whether or not their pane is drawn count from their own state instead: see
-    /// [`SlideApp::has_unsaved_work`].
+    /// isn't drawn: a File > Info property field being edited. Every other draft is kept by the app
+    /// in [`SlideApp::drafts`] and counts from there, drawn or not: see [`SlideApp::has_unsaved_work`].
     pub(crate) drafting: bool,
-    /// Text typed in a pane (a comment reply, alt text, a Notes Page) and not entered yet.
+    /// Text typed in a pane and not entered yet (a comment reply, alt text, Outline text, SmartArt
+    /// Text Pane lines, speaker notes), kept per presentation and per slide, shape or comment.
     pub(crate) drafts: drafts::Drafts,
     /// Faces borrowed from the font database for text the interface fonts can't draw (#101).
     pub ui_fonts: uifonts::UiFonts,

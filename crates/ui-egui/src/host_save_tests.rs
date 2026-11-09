@@ -14,6 +14,7 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{Harness, Node};
 use serde_json::json;
 
+use crate::drafts::ReplyOwner;
 use crate::{HostSave, OpenedFile, Services, SlideApp};
 
 /// One file handed to the page: name, Save As, presentation, and whether it saved the presentation.
@@ -270,7 +271,13 @@ fn a_reply_draft_counts_as_unsaved_work_with_the_comments_pane_hidden() {
     app.run("comment.add", json!({"text": "Check the figures"})).unwrap();
     mark_saved(&mut app);
     app.run("view.pane", json!({"pane": "comments"})).unwrap();
-    let uid = app.session.active().unwrap().uid;
+    // The comment the reply is typed under: told by who wrote it and what it says, which posting a
+    // reply doesn't change.
+    let owner = {
+        let st = app.session.active().unwrap();
+        let slide = &st.doc.slides[0];
+        ReplyOwner::of_comments(st.uid, slide.id, &slide.comments).remove(0)
+    };
     let mut h = harness(app);
     assert!(!h.state().has_unsaved_work());
 
@@ -280,12 +287,14 @@ fn a_reply_draft_counts_as_unsaved_work_with_the_comments_pane_hidden() {
     h.run_steps(2);
     assert!(h.state().has_unsaved_work(), "the typed reply would be lost");
     assert!(!h.state().session.active().unwrap().is_dirty(), "it is not in the presentation");
+    assert_eq!(h.state().drafts.reply(&owner), "Will do", "the app keeps it, not egui's temporary data");
 
     // With the pane hidden nothing draws the reply, but it is still there to come back.
     h.state_mut().run("view.pane", json!({})).unwrap();
     h.run_steps(3);
     assert!(h.query_all_by_role(Role::TextInput).all(|n| n.accesskit_node().data().placeholder() != Some("Reply…")), "the pane is not drawn");
     assert!(h.state().has_unsaved_work(), "hiding the pane doesn't drop the reply");
+    assert_eq!(h.state().drafts.reply(&owner), "Will do");
     h.state_mut().run("view.pane", json!({"pane": "comments"})).unwrap();
     h.run_steps(3);
     assert_eq!(field(&h, Role::TextInput, "Reply…").value().as_deref(), Some("Will do"), "the pane shows the reply again");
@@ -298,7 +307,7 @@ fn a_reply_draft_counts_as_unsaved_work_with_the_comments_pane_hidden() {
     h.run_steps(3);
     let comment = &h.state().session.active().unwrap().doc.slides[0].comments[0];
     assert_eq!(comment.replies.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["Will do"]);
-    assert_eq!(h.state().drafts.reply(uid, 0, 0), "", "the posted reply is not a draft any more");
+    assert_eq!(h.state().drafts.reply(&owner), "", "the posted reply is not a draft any more");
     mark_saved(h.state_mut());
     assert!(!h.state().has_unsaved_work(), "nothing is left to lose");
 }
@@ -368,4 +377,74 @@ fn alt_text_being_typed_counts_as_unsaved_work_with_the_format_pane_hidden() {
     assert_eq!(descr, "A bar chart");
     mark_saved(h.state_mut());
     assert!(!h.state().has_unsaved_work(), "applied alt text is no draft");
+}
+
+/// A slide title typed in the Outline and not entered yet is unsaved work although another view
+/// hides the Outline; the Outline enters it when it is drawn again.
+#[test]
+fn outline_text_being_typed_counts_as_unsaved_work_with_the_outline_hidden() {
+    let (mut app, _) = host_app(true);
+    app.run("file.new", json!({})).unwrap();
+    mark_saved(&mut app);
+    app.run("view.outline", json!({})).unwrap();
+    let mut h = harness(app);
+    assert!(!h.state().has_unsaved_work());
+
+    field(&h, Role::TextInput, "Slide title").click();
+    h.run_steps(1);
+    h.event(egui::Event::Text("Quarterly review".into()));
+    h.run_steps(2);
+    assert!(h.state().has_unsaved_work(), "the typed title would be lost");
+    assert!(!h.state().session.active().unwrap().is_dirty(), "it is not in the presentation");
+
+    // Another view hides the Outline: nothing draws the field, but the title is still there.
+    h.state_mut().run("view.normal", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().has_unsaved_work(), "hiding the Outline doesn't drop the title");
+    assert!(!h.state().session.active().unwrap().is_dirty());
+    h.state_mut().run("view.outline", json!({})).unwrap();
+    h.run_steps(3);
+    let st = h.state().session.active().unwrap();
+    assert_eq!(st.doc.slides[0].title(), "Quarterly review", "the Outline entered it when it came back");
+    assert!(st.is_dirty());
+    mark_saved(h.state_mut());
+    assert!(!h.state().has_unsaved_work(), "an entered title is no draft");
+}
+
+/// A SmartArt Text Pane line typed and not entered yet is unsaved work although the pane is hidden;
+/// the pane enters it when it is drawn again.
+#[test]
+fn smartart_text_being_typed_counts_as_unsaved_work_with_the_text_pane_hidden() {
+    let (mut app, _) = host_app(true);
+    app.run("file.new", json!({})).unwrap();
+    app.session.execute("insert.smartArt", &json!({"kind": "list", "items": ["Plan", "Build"]})).unwrap();
+    mark_saved(&mut app);
+    app.run("view.pane", json!({"pane": "smartart"})).unwrap();
+    let mut h = harness(app);
+    let nodes = |h: &Harness<'_, SlideApp>| -> Vec<String> {
+        let (_, d) = deckcraft_engine::cmd::smartart::selected(h.state().session.active().unwrap()).unwrap();
+        d.nodes.into_iter().map(|n| n.text).collect()
+    };
+    assert_eq!(nodes(&h), ["Plan", "Build"]);
+    assert!(!h.state().has_unsaved_work());
+
+    field(&h, Role::TextInput, "SmartArt text").click();
+    h.run_steps(1);
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text(" it".into()));
+    h.run_steps(2);
+    assert!(h.state().has_unsaved_work(), "the typed line would be lost");
+    assert!(!h.state().session.active().unwrap().is_dirty(), "it is not in the graphic");
+    assert_eq!(nodes(&h), ["Plan", "Build"]);
+
+    h.state_mut().run("view.pane", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().has_unsaved_work(), "hiding the pane doesn't drop the line");
+    assert!(!h.state().session.active().unwrap().is_dirty());
+    h.state_mut().run("view.pane", json!({"pane": "smartart"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(nodes(&h), ["Plan it", "Build"], "the pane entered it when it came back");
+    assert!(h.state().session.active().unwrap().is_dirty());
+    mark_saved(h.state_mut());
+    assert!(!h.state().has_unsaved_work(), "an entered line is no draft");
 }

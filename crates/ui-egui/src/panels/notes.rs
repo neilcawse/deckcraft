@@ -36,6 +36,18 @@ impl Draft {
     }
 }
 
+/// Saves the notes of presentation `doc` that were edited and not saved yet, each to the slide it
+/// was typed for (wherever that slide is by now), except those of the slide `typing` whose field has
+/// the focus. An edit left behind (the field lost focus, another slide was shown, or the pane was
+/// hidden first) goes in as the focus leaving the field would have put it.
+pub(crate) fn enter_edits(app: &mut crate::SlideApp, doc: u64, typing: Option<deckcraft_model::SlideId>) {
+    for (slide, body) in app.drafts.take_notes_edits(&app.session, doc, typing) {
+        if let Some(index) = crate::drafts::slide_index(&app.session, doc, slide) {
+            let _ = app.run("slide.notes", serde_json::json!({"body": body, "index": index}));
+        }
+    }
+}
+
 /// The draft as it reads with `text` typed in (one edit since the draft): `None` when that can't
 /// be mapped onto it.
 fn typed(body: &TextBody, text: &str) -> Option<TextBody> {

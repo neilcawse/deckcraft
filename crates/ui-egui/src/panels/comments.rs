@@ -1,4 +1,5 @@
 use super::{Align2, Color32, CornerRadius, Sense, SlideApp, Stroke, Tokens, Ui, Value, json, run, theme, vec2};
+use crate::drafts::ReplyOwner;
 
 /// Review › Compare: the revised copy's slide-level changes; click to go there, Accept to take it,
 /// Reject to drop it.
@@ -70,21 +71,31 @@ pub(super) fn comments(app: &mut SlideApp, ui: &mut Ui) {
         app.dialog = Some(crate::dialogs::Dialog::new("comment"));
     }
     ui.separator();
-    let threads: Vec<(usize, Vec<deckcraft_model::Comment>)> = app
+    // Each comment with the owner of the reply typed under it: who it is, not where it is, so moving
+    // or deleting slides and comments neither loses a reply nor hands it to another comment.
+    let threads: Vec<(usize, Vec<deckcraft_model::Comment>, Vec<ReplyOwner>)> = app
         .session
         .active()
-        .map(|st| st.doc.slides.iter().enumerate().filter(|(_, sl)| !sl.comments.is_empty()).map(|(i, sl)| (i, sl.comments.clone())).collect())
+        .map(|st| {
+            st.doc
+                .slides
+                .iter()
+                .enumerate()
+                .filter(|(_, sl)| !sl.comments.is_empty())
+                .map(|(i, sl)| (i, sl.comments.clone(), ReplyOwner::of_comments(st.uid, sl.id, &sl.comments)))
+                .collect()
+        })
         .unwrap_or_default();
     if threads.is_empty() {
         ui.label(egui::RichText::new("No comments.").color(t.text_dim));
         return;
     }
     let focus = app.ui.comment_focus;
-    for (si, list) in threads {
+    for (si, list, owners) in threads {
         ui.label(egui::RichText::new(format!("Slide {}", si + 1)).font(theme::bold(12.0)).color(t.text_dim));
         ui.add_space(2.0);
-        for (i, c) in list.iter().enumerate() {
-            comment_card(app, ui, si, i, c, focus == Some((si, i)));
+        for (i, (c, owner)) in list.iter().zip(owners).enumerate() {
+            comment_card(app, ui, si, i, c, owner, focus == Some((si, i)));
             ui.add_space(6.0);
         }
     }
@@ -96,8 +107,8 @@ fn focus_comment(app: &mut SlideApp, slide: usize, index: usize) {
 }
 
 /// Render one comment card, preserving its slide/index identity and focus state through actions.
-fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: &deckcraft_model::Comment, focused: bool) {
-    let Some(doc) = app.session.active().map(|st| st.uid) else { return };
+/// `owner` is the comment itself (not its place in the list) for the reply typed under it.
+fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: &deckcraft_model::Comment, owner: ReplyOwner, focused: bool) {
     let t = Tokens::get(ui.ctx());
     let stroke = if focused { Stroke::new(2.0, t.accent) } else { Stroke::NONE };
     let shown = egui::Frame::NONE
@@ -145,9 +156,9 @@ fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: 
                             _ => {}
                         }
                         if deleted {
-                            // The reply goes with its comment; the ones under later comments move up with them.
-                            app.drafts.comment_deleted(doc, slide, index);
-                            // This card is gone: the reply field is not drawn for it.
+                            // The reply goes with its comment. This card is gone: the reply field is
+                            // not drawn for it.
+                            app.drafts.set_reply(owner, String::new());
                             return;
                         }
                     }
@@ -157,14 +168,14 @@ fn comment_card(app: &mut SlideApp, ui: &mut Ui, slide: usize, index: usize, c: 
                     }
                     // The draft is the app's, not egui's temporary data: it is still there when the
                     // pane is shown again, and it counts as unsaved work meanwhile.
-                    let mut txt = app.drafts.reply(doc, slide, index);
+                    let mut txt = app.drafts.reply(&owner);
                     let r = ui.add(egui::TextEdit::singleline(&mut txt).hint_text("Reply…").desired_width(ui.available_width()));
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !txt.trim().is_empty() {
                         focus_comment(app, slide, index);
                         run(app, "comment.reply", json!({"index": index, "text": txt}));
                         txt.clear();
                     }
-                    app.drafts.set_reply(doc, slide, index, txt);
+                    app.drafts.set_reply(owner, txt);
                 });
             });
         });

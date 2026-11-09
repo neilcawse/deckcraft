@@ -326,6 +326,12 @@ fn composing_on_a_selected_shape_starts_editing_it() {
     assert_eq!(v["text"], "新しい");
 }
 
+/// The text in the notes field's draft of the shown slide.
+fn notes_draft_text(app: &SlideApp) -> String {
+    let st = app.session.active().unwrap();
+    app.drafts.notes_text(st.uid, st.current_slide().unwrap().id).unwrap_or_default()
+}
+
 /// The notes pane is an egui text field: composition shows in it and replaces each preedit, the
 /// candidate window is at its caret, and the notes are one undo step when it loses focus.
 #[test]
@@ -339,14 +345,14 @@ fn korean_composes_in_the_notes_pane() {
     for pre in ["ㄴ", "노", "놑", "노트"] {
         h.event(preedit(pre));
         h.run_steps(1);
-        assert_eq!(h.state().notes_buf.2.text, pre, "the preedit replaces the last one");
+        assert_eq!(notes_draft_text(h.state()), pre, "the preedit replaces the last one");
     }
     let ime = h.output().platform_output.ime.as_ref().expect("the notes field turns the input method on");
     let slide = h.state().slide_rect.unwrap();
     assert!(ime.cursor_rect.min.y > slide.max.y, "candidate window at the notes caret, under the slide");
     h.event(Event::Ime(ImeEvent::Commit("노트".into())));
     h.run_steps(1);
-    assert_eq!(h.state().notes_buf.2.text, "노트");
+    assert_eq!(notes_draft_text(h.state()), "노트");
     // Focus leaves the field (Escape): the notes are committed as one step.
     h.key_press(egui::Key::Escape);
     h.run_steps(2);

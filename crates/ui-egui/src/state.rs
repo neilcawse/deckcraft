@@ -86,8 +86,6 @@ pub struct UiState {
     pub smartart_row: usize,
     /// A Text Pane line to focus once it is drawn (after Enter, Tab or Backspace rebuilt the list).
     pub smartart_focus: Option<usize>,
-    /// The Text Pane's line drafts, for the SmartArt group they were read from.
-    pub smartart_drafts: (u32, Vec<String>),
     pub grayscale: bool,
     /// Comment the Review Previous/Next buttons last landed on: `(slide, index)`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,7 +121,6 @@ impl Default for UiState {
             format_tab: "fill".into(),
             smartart_row: 0,
             smartart_focus: None,
-            smartart_drafts: (0, vec![]),
             grayscale: false,
             comment_focus: None,
             qat: qat::defaults(),

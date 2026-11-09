@@ -1,4 +1,5 @@
 use super::{SlideApp, Tokens, Ui, Value, json, run};
+use crate::drafts::Tree;
 
 /// SmartArt Text Pane: one line per node, indented by level. Enter adds a line after, Tab and
 /// Shift+Tab demote and promote, Backspace in an empty line removes it.
@@ -8,13 +9,18 @@ pub(super) fn smartart(app: &mut SlideApp, ui: &mut Ui) {
         return;
     };
     let texts: Vec<String> = d.nodes.iter().map(|n| n.text.clone()).collect();
-    let focused_any = ui.ctx().memory(|m| m.focused().is_some()) || app.ui.smartart_focus.is_some();
-    if app.ui.smartart_drafts.0 != gid.0 || app.ui.smartart_drafts.1.len() != texts.len() || !focused_any {
-        app.ui.smartart_drafts = (gid.0, texts.clone());
+    // The lines typed and not entered yet are the app's, not this pane's: they are still there when
+    // the pane is drawn again (a view, slide or selection that hid it came and went), and they count
+    // as unsaved work meanwhile. They belong to the graphic (on its slide, master or layout), and
+    // only while its text is still what they started from; otherwise the pane shows its text.
+    let at = app.session.active().and_then(|st| Tree::of(st).map(|tree| (st.uid, tree)));
+    let mut drafts = at.map_or_else(|| texts.clone(), |(doc, tree)| app.drafts.smartart_lines(doc, tree, gid, &texts));
+    if drafts.len() != texts.len() {
+        drafts.clone_from(&texts);
     }
-    let mut drafts = std::mem::take(&mut app.ui.smartart_drafts.1);
     let mut action: Option<(&str, Value)> = None;
     let mut commit: Option<usize> = None;
+    let mut left_behind: Vec<usize> = Vec::new();
     let mut focus_row: Option<usize> = None;
     ui.label(egui::RichText::new("Type your text here").color(Tokens::get(ui.ctx()).text_dim));
     ui.add_space(4.0);
@@ -26,6 +32,12 @@ pub(super) fn smartart(app: &mut SlideApp, ui: &mut Ui) {
             ui.label("•");
             let te = egui::TextEdit::singleline(draft).id(id).hint_text("SmartArt text").desired_width(f32::INFINITY);
             let r = ui.add(te);
+            // (The widget's own `has_focus` is also false while the window is unfocused: this asks egui's memory.)
+            let kept = ui.ctx().memory(|m| m.has_focus(id)) || r.lost_focus();
+            if !kept && texts.get(i).is_some_and(|t| t != &*draft) {
+                // Typed before this pane was hidden, and nothing has the line now.
+                left_behind.push(i);
+            }
             if app.ui.smartart_focus == Some(i) {
                 r.request_focus();
                 app.ui.smartart_focus = None;
@@ -74,10 +86,23 @@ pub(super) fn smartart(app: &mut SlideApp, ui: &mut Ui) {
                 run(app, "smartArt.setNodes", json!({"id": gid.0, "index": i, "text": t}));
             }
         }
+    } else {
+        // A line typed before the pane was hidden goes in as the focus leaving it would have put it.
+        for &i in &left_behind {
+            if let Some(t) = drafts.get(i) {
+                run(app, "smartArt.setNodes", json!({"id": gid.0, "index": i, "text": t}));
+            }
+        }
     }
-    // Lines typed but not yet committed (committed ones made the presentation unsaved instead).
-    app.drafting |= commit.is_none() && action.is_none() && drafts.iter().zip(&texts).any(|(d, t)| d != t);
-    app.ui.smartart_drafts.1 = drafts;
+    // Lines typed and not entered yet stay with the app, to be counted whether or not this pane is
+    // drawn again; what was just entered made the presentation unsaved instead.
+    if let Some((doc, tree)) = at {
+        if commit.is_none() && action.is_none() && left_behind.is_empty() {
+            app.drafts.set_smartart(doc, tree, gid, &texts, drafts);
+        } else {
+            app.drafts.drop_smartart(doc, tree, gid);
+        }
+    }
     if let Some((cmd, mut p)) = action {
         if let Some(o) = p.as_object_mut() {
             o.insert("id".into(), json!(gid.0));
@@ -85,7 +110,6 @@ pub(super) fn smartart(app: &mut SlideApp, ui: &mut Ui) {
         if let Ok(r) = app.run(cmd, p) {
             let row = r.get("index").and_then(Value::as_u64).map(|v| v as usize).or(focus_row).unwrap_or(0);
             app.ui.smartart_row = row;
-            app.ui.smartart_drafts.0 = 0;
             app.ui.smartart_focus = Some(row);
         }
     }

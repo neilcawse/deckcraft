@@ -7,6 +7,7 @@ use egui::{Align2, Color32, CornerRadius, Rect, Role, Sense, Stroke, Ui, WidgetI
 use serde_json::json;
 
 use crate::SlideApp;
+use crate::drafts::TextOwner;
 use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 
@@ -366,6 +367,7 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
     let doc = st.doc.clone();
     let idx = st.selection.slide;
     let uid = st.uid;
+    let sid = st.current_slide().map(|s| s.id);
     let page_h = avail.height() - 40.0;
     let page_w = page_h * 8.5 / 11.0;
     let page = Rect::from_center_size(avail.center(), vec2(page_w, page_h));
@@ -398,21 +400,18 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
     ui.painter().rect_stroke(srect, CornerRadius::ZERO, Stroke::new(1.0, Color32::GRAY), egui::StrokeKind::Outside);
     let notes_rect = to_screen((notes_box.x0, notes_box.y0, notes_box.x1, notes_box.y1));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(notes_rect));
-    // A draft belongs to this document and to the notes it started from (#413): another document,
-    // a reorder or an undo that changes them drops it. The app keeps it, so it counts as unsaved
-    // work although this view isn't drawn (and so does a draft left on another slide).
+    // A draft belongs to this document, to its slide (not to a place in the deck) and to the notes it
+    // started from (#413): another document, a slide that went away or an undo that changes them
+    // drops it. The app keeps it, so it counts as unsaved work although this view isn't drawn.
     let edit_id = egui::Id::unique(("notespage-edit", idx));
     let focused = child.ctx().memory(|m| m.has_focus(edit_id));
-    let notes_of = |app: &SlideApp| app.session.active().and_then(|st| st.doc.slides.get(idx)).map(|s| s.notes.clone()).unwrap_or_default();
+    // Notes edited and left behind (the field lost focus, another slide is shown, this view was
+    // hidden first) are saved before anything reloads them, each to the slide it was typed for.
+    crate::notes::enter_edits(app, uid, sid.filter(|_| focused));
+    let notes_of = |app: &SlideApp| app.session.active().and_then(|st| st.current_slide()).map(|s| s.notes.clone()).unwrap_or_default();
     let notes = notes_of(app);
-    let mut draft = app.drafts.notes_page(uid, idx, &notes);
-    // Save an edited draft once the field has lost focus, before anything reloads it.
-    if !focused && let Some(d) = draft.as_mut().filter(|d| d.edited) {
-        d.edited = false;
-        let _ = app.run("slide.notes", json!({"body": d.body, "index": idx}));
-    }
-    let notes = notes_of(app);
-    let mut draft = draft.filter(|d| focused || d.body == notes).unwrap_or_else(|| crate::notes::Draft::new(&notes));
+    let mut draft =
+        sid.and_then(|s| app.drafts.notes(uid, s, &notes)).filter(|d| focused || d.body == notes).unwrap_or_else(|| crate::notes::Draft::new(&notes));
     let look = crate::notes::Look { size: 14.0, color: Some(Color32::from_gray(30)) };
     let width = notes_rect.width();
     let r = crate::notes::editor(&mut child, &mut draft, &look, |e| {
@@ -424,11 +423,13 @@ pub fn notes_page(app: &mut SlideApp, ui: &mut Ui) {
         draft.edited = false;
         let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
     }
-    let base = notes_of(app);
-    if draft.edited || r.has_focus() {
-        app.drafts.keep_notes_page(uid, idx, base, draft);
-    } else {
-        app.drafts.drop_notes_page(uid, idx);
+    if let Some(s) = sid {
+        if draft.edited || child.ctx().memory(|m| m.has_focus(edit_id)) {
+            let base = notes_of(app);
+            app.drafts.keep_notes(uid, s, base, draft);
+        } else {
+            app.drafts.drop_notes(uid, s);
+        }
     }
     let nav = ui.input(|i| (i.key_pressed(egui::Key::PageDown), i.key_pressed(egui::Key::PageUp)));
     if nav.0 {
@@ -488,33 +489,34 @@ fn outline_estimate(s: &deckcraft_model::Slide) -> f32 {
     30.0 + lines as f32 * 19.0
 }
 
-/// One slide in the outline: number, title editor, then its other text.
+/// One slide in the outline: number, title editor, then its other text. What is typed into a field
+/// stays with the app as a draft of that slide's shape until the focus leaves the field, so it still
+/// counts as unsaved work while the Outline is hidden (by another view, say), and it goes into the
+/// presentation, as the focus leaving would have put it, when the field is drawn again.
 fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deckcraft_model::Slide, cur: usize) {
-    let title_shape = s.shapes.iter().find(|x| x.ph_type().is_some_and(|k| k.is_title())).map(|x| x.id.0);
+    let Some(uid) = app.session.active().map(|st| st.uid) else { return };
+    let title_shape = s.shapes.iter().find(|x| x.ph_type().is_some_and(|k| k.is_title())).map(|x| x.id);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{}", i + 1)).color(t.text_dim));
         let (r, _) = ui.allocate_exact_size(vec2(14.0, 10.0), Sense::hover());
         ui.painter().rect_stroke(r, CornerRadius::same(1), Stroke::new(1.0, if i == cur { t.accent } else { t.text_dim }), egui::StrokeKind::Inside);
-        let id = egui::Id::unique(("ol-title", s.id.0));
         let cur_title = s.title();
-        let mut v: String = ui.data_mut(|d| d.get_temp(id).unwrap_or_else(|| cur_title.clone()));
+        let owner = title_shape.map(|shape| TextOwner::outline_title(uid, s.id, shape));
+        let mut v = crate::widgets::text_draft(owner.as_ref().and_then(|o| app.drafts.text(o)), &cur_title);
         let resp = ui.add(
             egui::TextEdit::singleline(&mut v).hint_text("Slide title").font(theme::bold(14.0)).frame(egui::Frame::NONE).desired_width(f32::INFINITY),
         );
         if resp.gained_focus() {
             let _ = app.run("slide.go", json!({"index": i}));
         }
-        if resp.lost_focus()
-            && v != cur_title
-            && let Some(tid) = title_shape
-        {
-            let _ = app.run("text.set", json!({"id": tid, "text": v}));
-        }
-        if !resp.has_focus() {
-            ui.data_mut(|d| d.remove::<String>(id));
-        } else {
-            app.drafting |= v != cur_title;
-            ui.data_mut(|d| d.insert_temp(id, v));
+        if let (Some(owner), Some(shape)) = (owner, title_shape) {
+            if !ui.ctx().memory(|m| m.has_focus(resp.id)) && v != cur_title {
+                // The focus left the field, or it was typed in before the Outline was hidden.
+                let _ = app.run("text.set", json!({"id": shape.0, "text": v}));
+                app.drafts.drop_text(&owner);
+            } else {
+                app.drafts.set_text(owner, &cur_title, v);
+            }
         }
     });
     for sh in s.shapes.iter().filter(|x| !x.ph_type().is_some_and(|k| k.is_title())) {
@@ -522,9 +524,9 @@ fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deck
         if tb.is_empty() {
             continue;
         }
-        let id = egui::Id::unique(("ol-body", s.id.0, sh.id.0));
-        let cur_text: String = tb.paragraphs.iter().map(|p| format!("{}{}", "\t".repeat(p.level as usize), p.text())).collect::<Vec<_>>().join("\n");
-        let mut v: String = ui.data_mut(|d| d.get_temp(id).unwrap_or_else(|| cur_text.clone()));
+        let owner = TextOwner::outline_body(uid, s.id, sh.id);
+        let cur_text = crate::drafts::outline_body(tb);
+        let mut v = crate::widgets::text_draft(app.drafts.text(&owner), &cur_text);
         ui.horizontal(|ui| {
             ui.add_space(36.0);
             let resp = ui
@@ -532,14 +534,12 @@ fn outline_slide(app: &mut SlideApp, ui: &mut Ui, t: &Tokens, i: usize, s: &deck
             if resp.gained_focus() {
                 let _ = app.run("slide.go", json!({"index": i}));
             }
-            if resp.lost_focus() && v != cur_text {
+            if !ui.ctx().memory(|m| m.has_focus(resp.id)) && v != cur_text {
+                // The focus left the field, or it was typed in before the Outline was hidden.
                 let _ = app.run("text.set", json!({"id": sh.id.0, "text": v}));
-            }
-            if !resp.has_focus() {
-                ui.data_mut(|d| d.remove::<String>(id));
+                app.drafts.drop_text(&owner);
             } else {
-                app.drafting |= v != cur_text;
-                ui.data_mut(|d| d.insert_temp(id, v.clone()));
+                app.drafts.set_text(owner, &cur_text, v);
             }
         });
     }

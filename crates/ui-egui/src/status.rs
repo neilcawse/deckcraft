@@ -182,16 +182,12 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
         return;
     }
     let (idx, uid) = (st.selection.slide, st.uid);
-    // Save an edited draft once the field has lost focus or another slide is shown (before
-    // anything reloads it), to the slide it was written on.
+    let sid = st.current_slide().map(|s| s.id);
+    // Save notes edited and left behind (the field lost focus, another slide is shown, this pane was
+    // hidden) before anything reloads them, each to the slide it was written on.
     let id = egui::Id::unique("notes_edit");
     let focused = ui.ctx().memory(|m| m.has_focus(id));
-    if app.notes_buf.2.edited && (!focused || app.notes_buf.0 != uid || app.notes_buf.1 != idx) {
-        app.notes_buf.2.edited = false;
-        if app.notes_buf.0 == uid {
-            let _ = app.run("slide.notes", json!({"body": app.notes_buf.2.body, "index": app.notes_buf.1}));
-        }
-    }
+    crate::notes::enter_edits(app, uid, sid.filter(|_| focused));
     let notes = app.session.active().and_then(|st| st.current_slide()).map(|s| s.notes.clone()).unwrap_or_default();
     egui::Panel::bottom("notes")
         .resizable(true)
@@ -203,11 +199,11 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
             let rect = ui.max_rect();
             ui.painter()
                 .line_segment([pos2(rect.min.x - 8.0, rect.min.y - 6.0), pos2(rect.max.x + 8.0, rect.min.y - 6.0)], Stroke::new(1.0, t.separator));
-            // Keep a local draft per slide, following the notes while the field isn't focused.
-            if app.notes_buf.0 != uid || app.notes_buf.1 != idx || (!focused && app.notes_buf.2.body != notes) {
-                app.notes_buf = (uid, idx, crate::notes::Draft::new(&notes));
-            }
-            let mut draft = app.notes_buf.2.clone();
+            // Keep a draft per slide, following the notes while the field isn't focused.
+            let mut draft = sid
+                .and_then(|s| app.drafts.notes(uid, s, &notes))
+                .filter(|d| focused || d.body == notes)
+                .unwrap_or_else(|| crate::notes::Draft::new(&notes));
             let look = crate::notes::Look { size: 13.0, color: None };
             // Long notes scroll inside the pane instead of spilling over the slide (#221).
             let out = egui::ScrollArea::vertical()
@@ -304,8 +300,16 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
                 draft.edited = false;
                 let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
             }
-            // `has_unsaved_work` reads `notes_buf` itself, so an edit still counts if this pane is hidden.
-            app.notes_buf.2 = draft;
+            // The app keeps a draft that is being edited or typed in, so an edit still counts as
+            // unsaved work if this pane is hidden, and still goes to its own slide.
+            if let Some(s) = sid {
+                if draft.edited || ui.ctx().memory(|m| m.has_focus(id)) {
+                    let base = app.session.active().and_then(|st| st.doc.slide(s)).map(|sl| sl.notes.clone()).unwrap_or_default();
+                    app.drafts.keep_notes(uid, s, base, draft);
+                } else {
+                    app.drafts.drop_notes(uid, s);
+                }
+            }
         });
 }
 
