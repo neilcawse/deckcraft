@@ -344,6 +344,7 @@ fn rewrite_zip_entry(bytes: &[u8], entry_name: &str, f: impl Fn(&str) -> String)
 }
 
 #[test]
+
 fn paragraph_build_without_bld_lst_still_folds_into_by_paragraph() {
     use deckcraft_model::anim::{AnimClass, AnimStart, Animation, TextBuild};
     let mut pres = defaults::new_presentation(None);
