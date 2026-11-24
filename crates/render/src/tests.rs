@@ -3413,3 +3413,95 @@ fn a_shape_whose_outline_is_not_finite_is_not_drawable() {
     quad.paths[0].path = path;
     assert!(!crate::geometry::drawable(&quad, m, 100.0, 50.0));
 }
+
+#[test]
+fn gradient_with_transparent_stop_interpolates_in_unpremultiplied_rgba() {
+    // DrawingML/PowerPoint interpolates gradient stops in straight (unpremultiplied) RGBA.
+    // A light alpha=0 stop fading to a dark semi-transparent stop over a dark backdrop must
+    // brighten midtones instead of discarding the transparent stop's RGB.
+    use deckcraft_color::Rgba;
+    use deckcraft_model::style::{Fill, Gradient, GradientShape, GradientStop};
+    let backdrop = Shape {
+        id: ShapeId(901),
+        xfrm: Some(Xfrm::new(0.0, 0.0, 200.0, 100.0)),
+        fill: Some(Fill::solid(ColorRef::rgb(Rgba::rgb(20, 60, 90)))),
+        ..Default::default()
+    };
+    let overlay = Shape {
+        id: ShapeId(902),
+        xfrm: Some(Xfrm::new(0.0, 0.0, 200.0, 100.0)),
+        fill: Some(Fill::Gradient(Gradient {
+            stops: vec![
+                GradientStop { pos: 0.0, color: ColorRef::rgb(Rgba::rgba(240, 248, 255, 0)) },
+                GradientStop { pos: 0.75, color: ColorRef::rgb(Rgba::rgba(12, 34, 50, 194)) },
+            ],
+            shape: GradientShape::Linear { angle: 0.0, scaled: false },
+            flip: None,
+            rotate_with_shape: true,
+            tile: [0.0; 4],
+        })),
+        ..Default::default()
+    };
+    let p = deck_with(vec![backdrop, overlay]);
+    let img = render_slide(&p, 0, &RenderOpts { scale: 1.0, ..Default::default() });
+    // At x = 50 (pos = 0.25 -> t = 1/3 along the 0..0.75 ramp):
+    // Straight RGBA gives approx (164, 177, 187, a=0.254) over (20, 60, 90) => R ~ 56.
+    // Premultiplied RGBA would zero out stop 0 RGB and darken R to ~18.
+    let mid = img.pixel(50, 50);
+    assert!(mid[0] > 45 && mid[1] > 80, "expected unpremultiplied brightening at midtone, got {mid:?}");
+    // At x = 180 (pos = 0.90, clamped at stop 1): dark overlay applies normally.
+    let end = img.pixel(180, 50);
+    assert!(end[0] < 20 && end[1] < 45, "expected darkened end stop, got {end:?}");
+}
+
+#[test]
+fn table_style_with_direct_font_in_tc_tx_style_falls_back_to_grid() {
+    // PowerPoint rejects custom tableStyles.xml definitions whose a:tcTxStyle uses a direct
+    // <a:font> element instead of <a:fontRef>, falling back to "No Style, Table Grid".
+    use deckcraft_color::Rgba;
+    use deckcraft_model::style::Fill;
+    use deckcraft_model::table::{TablePart, TablePartStyle, TableStyleDef};
+    let guid = "{11111111-2222-3333-4444-555555555555}";
+    let mut t = Table::new(3, 2, 200.0, 40.0);
+    t.style = guid.into();
+    t.first_row = true;
+    t.band_row = true;
+    let header = TablePartStyle { fill: Some(Fill::solid(ColorRef::rgb(Rgba::rgb(220, 0, 0)))), bold: Some(true), ..Default::default() };
+    let band = TablePartStyle { fill: Some(Fill::solid(ColorRef::rgb(Rgba::rgb(245, 200, 200)))), ..Default::default() };
+    let rejected_raw = format!(
+        r#"<a:tblStyle styleId="{guid}" styleName="Custom"><a:wholeTbl><a:tcTxStyle b="off"><a:font><a:latin typeface="Arial"/><a:ea typeface="Arial"/><a:cs typeface="Arial"/></a:font><a:schemeClr val="dk1"/></a:tcTxStyle></a:wholeTbl></a:tblStyle>"#
+    );
+    let def = TableStyleDef {
+        id: guid.into(),
+        name: "Custom".into(),
+        parts: vec![(TablePart::FirstRow, header.clone()), (TablePart::Band1H, band.clone())],
+        background: None,
+        raw: rejected_raw,
+    };
+    let tbl = Shape { id: ShapeId(903), xfrm: Some(Xfrm::new(100.0, 100.0, 200.0, 120.0)), kind: ShapeKind::Table(t.clone()), ..Default::default() };
+    let mut p = deck_with(vec![tbl]);
+    p.table_styles.push(def);
+    let img = render_slide(&p, 0, &RenderOpts { scale: 1.0, ..Default::default() });
+    // Rejected style: header and banded cells stay transparent (white slide shows through) instead of red/pink.
+    assert_eq!(img.pixel(150, 120)[..3], [255, 255, 255], "header cell must not take rejected style fill");
+    assert_eq!(img.pixel(150, 160)[..3], [255, 255, 255], "banded cell must not take rejected style fill");
+    // And a dark grid border is drawn between row 0 and row 1.
+    let bdr = img.pixel(150, 140);
+    assert!(bdr[0] < 180 && bdr[1] < 180 && bdr[2] < 180, "expected dark table grid border, got {bdr:?}");
+
+    // By contrast, a custom style using <a:fontRef> is valid in PowerPoint and renders its fills.
+    let valid_raw = format!(
+        r#"<a:tblStyle styleId="{guid}" styleName="Valid"><a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="dk1"/></a:tcTxStyle></a:wholeTbl></a:tblStyle>"#
+    );
+    p.table_styles[0].raw = valid_raw;
+    let img_valid = render_slide(&p, 0, &RenderOpts { scale: 1.0, ..Default::default() });
+    assert_eq!(img_valid.pixel(150, 120)[..3], [220, 0, 0], "valid fontRef style must apply header fill");
+
+    // An unknown GUID not present in table_styles also falls back to grid rather than medium2.
+    p.table_styles.clear();
+    let ctx = Ctx::for_slide(&p, &p.slides[0]).unwrap();
+    let lk = crate::table::look_with_def(&ctx, None, &t, 0, 0);
+    assert_eq!(lk.fill, None);
+    assert!(!lk.bold);
+    assert!(lk.border.is_some());
+}

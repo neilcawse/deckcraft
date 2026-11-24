@@ -433,3 +433,17 @@ fn disabling_system_fallback_gates_automatic_family_loads() {
     db.set_system_fallback(false);
     assert!(!db.system_fallback_enabled());
 }
+
+#[test]
+fn office_serif_fonts_keep_serif_substitute_and_aptos_prefers_carlito() {
+    assert!(substitutes("Aptos").contains(&"Carlito"));
+    let db = FontDb::global();
+    let calibri = db.face(MISSING_FONT_FAMILY, "Regular").family.clone();
+    for serif in ["Georgia", "Garamond", "Palatino Linotype", "Constantia"] {
+        let f = db.document_face(serif, "Regular");
+        assert_eq!(f.family, db.face(serif, "Regular").family, "{serif}");
+        if !db.has_family(serif) && db.has_family("Liberation Serif") {
+            assert_ne!(f.family, calibri, "{serif} must keep a serif substitute instead of Calibri");
+        }
+    }
+}

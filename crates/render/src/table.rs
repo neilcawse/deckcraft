@@ -138,8 +138,50 @@ fn border_look(ctx: &Ctx, b: &TableBorder) -> (Rgba, f64) {
     }
 }
 
+/// PowerPoint's `tableStyles.xml` loader only accepts theme font references (`a:fontRef`) inside
+/// `a:tcTxStyle`; a direct font collection (`a:font`, as some third-party exporters write) causes
+/// PowerPoint to reject the style and fall back to "No Style, Table Grid".
+fn contains_direct_font_tag(inner: &str) -> bool {
+    let mut scan = inner;
+    while let Some(lt) = scan.find('<') {
+        let tag = &scan[lt + 1..];
+        let end = tag.find(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '/')).unwrap_or(tag.len());
+        let qname = &tag[..end];
+        let local = qname.rsplit_once(':').map(|(_, n)| n).unwrap_or(qname);
+        if local == "font" {
+            return true;
+        }
+        scan = tag;
+    }
+    false
+}
+
+fn tc_tx_style_has_direct_font(raw: &str) -> bool {
+    let mut rest = raw;
+    while let Some(open) = rest.find("tcTxStyle") {
+        let after_open = &rest[open + "tcTxStyle".len()..];
+        let Some(gt) = after_open.find('>') else { break };
+        let is_closing = rest[..open].rfind('<').is_some_and(|lt| rest[lt + 1..open].starts_with('/'));
+        if is_closing || after_open[..gt].trim_end().ends_with('/') {
+            rest = &after_open[gt + 1..];
+            continue;
+        }
+        let body = &after_open[gt + 1..];
+        let Some(close) = body.find("tcTxStyle") else { break };
+        if contains_direct_font_tag(&body[..close]) {
+            return true;
+        }
+        rest = &body[close + "tcTxStyle".len()..];
+    }
+    false
+}
+
 pub fn resolve_style<'a>(ctx: &'a Ctx, t: &Table) -> Option<&'a TableStyleDef> {
-    ctx.pres.table_styles.iter().find(|d| d.id.eq_ignore_ascii_case(&t.style))
+    let def = ctx.pres.table_styles.iter().find(|d| d.id.eq_ignore_ascii_case(&t.style))?;
+    if !def.raw.is_empty() && tc_tx_style_has_direct_font(&def.raw) {
+        return None;
+    }
+    Some(def)
 }
 
 #[allow(dead_code)]
@@ -249,9 +291,14 @@ pub fn look_with_def(ctx: &Ctx, def: Option<&TableStyleDef>, t: &Table, r: usize
     let dk1 = ctx.color(&ColorRef::scheme(SchemeSlot::Dk1), None);
     let lt1 = ctx.color(&ColorRef::scheme(SchemeSlot::Lt1), None);
     let on = |fill: Rgba| if dk1.contrast(fill) >= lt1.contrast(fill) { dk1 } else { lt1 };
+    // An unresolved or rejected table style GUID (`{...}`) falls back to "No Style, Table Grid"
+    // rather than an accented banded preset, matching PowerPoint ([MS-OE376] §5.1.6.10).
     match kind {
         "none" => CellLook { fill: None, text: None, bold: false, border: None, sides: [None; 4], paint: None },
         "grid" => CellLook { fill: None, text: None, bold: false, border: Some((text_color, 0.75)), sides: [None; 4], paint: None },
+        _ if t.style.starts_with('{') => {
+            CellLook { fill: None, text: None, bold: false, border: Some((text_color, 0.75)), sides: [None; 4], paint: None }
+        }
         "light1" => light1_look(a, p, on),
         "light2" => light2_look(a, p),
         "dark1" => dark1_look(a, p),
