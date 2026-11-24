@@ -3505,3 +3505,41 @@ fn table_style_with_direct_font_in_tc_tx_style_falls_back_to_grid() {
     assert!(!lk.bold);
     assert!(lk.border.is_some());
 }
+
+#[test]
+fn builtin_table_style_guid_without_def_keeps_styled_look_while_unknown_guid_falls_back_to_grid() {
+    // [MS-OE376] §2.1.1343 built-in GUIDs (e.g. Light Style 1) without an inline tblStyleLst entry
+    // must NOT regress to the plain grid fallback, whereas truly unknown/custom GUIDs DO fall back
+    // to "No Style, Table Grid".
+    let light_style_1 = "{9D7B26C5-4107-4FEC-AEDC-1716B250A1EF}";
+    let unknown_guid = "{11111111-2222-3333-4444-555555555555}";
+
+    assert!(crate::table::is_builtin_table_style_guid(light_style_1));
+    assert!(crate::table::is_builtin_table_style_guid("{9d7b26c5-4107-4fec-aedc-1716b250a1ef}"));
+    assert!(crate::table::is_builtin_table_style_guid("9D7B26C5-4107-4FEC-AEDC-1716B250A1EF"));
+    assert!(crate::table::is_builtin_table_style_guid("{3C2FFA5D-87B4-456A-9821-1D502468CF0F}")); // Themed Style 1 - Accent 1
+    assert!(crate::table::is_builtin_table_style_guid("{D7AC3CCA-C797-4891-BE02-D94E43425B78}")); // Medium Style 4
+    assert!(crate::table::is_builtin_table_style_guid("{E8034E78-7F5D-4C2E-B375-FC64B27BC917}")); // Dark Style 1
+    assert!(!crate::table::is_builtin_table_style_guid("{9D7B26C5-4107-4FEC-AEDC-1716B250A1EF")); // malformed braces
+    assert!(!crate::table::is_builtin_table_style_guid(unknown_guid));
+
+    let mut t_builtin = Table::new(3, 2, 200.0, 40.0);
+    t_builtin.style = light_style_1.into();
+    t_builtin.first_row = true;
+    t_builtin.band_row = true;
+
+    let mut t_unknown = t_builtin.clone();
+    t_unknown.style = unknown_guid.into();
+
+    let p = deck_with(vec![]);
+    let ctx = Ctx::for_slide(&p, &p.slides[0]).unwrap();
+
+    let lk_builtin = crate::table::look_with_style(&ctx, crate::table::resolve_style(&ctx, &t_builtin), &t_builtin, 0, 0);
+    assert!(lk_builtin.fill.is_some(), "built-in Light Style 1 GUID without tblStyleLst must keep a styled header fill");
+    assert!(lk_builtin.bold, "built-in Light Style 1 GUID without tblStyleLst must keep styled header bold");
+
+    let lk_unknown = crate::table::look_with_style(&ctx, crate::table::resolve_style(&ctx, &t_unknown), &t_unknown, 0, 0);
+    assert_eq!(lk_unknown.fill, None, "unknown custom GUID must fall back to plain grid (no fill)");
+    assert!(!lk_unknown.bold, "unknown custom GUID must fall back to plain grid (not bold)");
+    assert!(lk_unknown.border.is_some(), "unknown custom GUID must fall back to plain grid borders");
+}
