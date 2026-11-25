@@ -615,70 +615,103 @@ fn apply_slide_hlink_clr(e: &craft_xml::El, shapes: &mut [Shape], depth: usize) 
     }
 }
 
+fn extract_svg_blip_rel_attr(inner: &str) -> Option<&str> {
+    let svg_pos = inner.find("svgBlip")?;
+    let svg_tail = &inner[svg_pos..];
+    let tag_end = svg_tail.find('>')?;
+    let svg_tag = &svg_tail[..tag_end];
+    for (key, quote) in [("r:embed=\"", '"'), ("r:link=\"", '"'), ("r:embed='", '\''), ("r:link='", '\'')] {
+        if let Some(kpos) = svg_tag.find(key) {
+            let val_start = kpos + key.len();
+            let val_end = svg_tag[val_start..].find(quote)?;
+            return Some(&svg_tag[kpos..val_start + val_end + 1]);
+        }
+    }
+    None
+}
+
 fn rewrite_svg_only_blip_xml(xml: &str) -> Option<String> {
-    if !xml.contains("<a:blip>") || !xml.contains("svgBlip") {
+    if !xml.contains("svgBlip") || !xml.contains("<a:blip") {
         return None;
     }
     let mut out = String::with_capacity(xml.len() + 64);
     let mut rest = xml;
     let mut changed = false;
-    while let Some(pos) = rest.find("<a:blip>") {
+    while let Some(pos) = rest.find("<a:blip") {
         out.push_str(&rest[..pos]);
-        let after = &rest[pos + "<a:blip>".len()..];
-        if let Some(end_pos) = after.find("</a:blip>") {
-            let inner = &after[..end_pos];
-            let attr = inner.find("svgBlip").and_then(|svg_pos| {
-                let svg_tail = &inner[svg_pos..];
-                let tag_end = svg_tail.find('>')?;
-                let svg_tag = &svg_tail[..tag_end];
-                for key in ["r:embed=\"", "r:link=\""] {
-                    if let Some(kpos) = svg_tag.find(key) {
-                        let val_start = kpos + key.len();
-                        let val_end = svg_tag[val_start..].find('"')?;
-                        return Some(&svg_tag[kpos..val_start + val_end + 1]);
-                    }
-                }
-                None
-            });
-            if let Some(attr) = attr {
-                out.push_str("<a:blip ");
-                out.push_str(attr);
-                out.push('>');
-                changed = true;
-            } else {
-                out.push_str("<a:blip>");
-            }
-        } else {
-            out.push_str("<a:blip>");
+        let after_name = &rest[pos + "<a:blip".len()..];
+        let next = after_name.as_bytes().first().copied();
+        if !matches!(next, Some(b'>' | b' ' | b'\t' | b'\r' | b'\n')) {
+            out.push_str("<a:blip");
+            rest = after_name;
+            continue;
         }
-        rest = after;
+        let Some(open_end) = after_name.find('>') else {
+            out.push_str("<a:blip");
+            rest = after_name;
+            continue;
+        };
+        let open_attrs = &after_name[..open_end];
+        let after_open = &after_name[open_end + 1..];
+        let has_rel = open_attrs.contains("r:embed=") || open_attrs.contains("r:link=");
+        if !open_attrs.ends_with('/')
+            && !has_rel
+            && let Some(end_pos) = after_open.find("</a:blip>")
+            && let Some(attr) = extract_svg_blip_rel_attr(&after_open[..end_pos])
+        {
+            out.push_str("<a:blip ");
+            out.push_str(attr);
+            out.push_str(open_attrs);
+            out.push('>');
+            changed = true;
+        } else {
+            out.push_str("<a:blip");
+            out.push_str(open_attrs);
+            out.push('>');
+        }
+        rest = after_open;
     }
     out.push_str(rest);
     changed.then_some(out)
 }
 
 fn normalize_svg_only_blips(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let Ok(mut lazy) = craft_opc::LazyPackage::open(bytes, &craft_pptx::LIMITS) else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    let xml_names: Vec<String> = lazy
+        .names()
+        .into_iter()
+        .filter(|name| name.ends_with(".xml") && !name.starts_with("docprops/") && *name != "[content_types].xml")
+        .map(str::to_string)
+        .collect();
+    let mut rewritten = std::collections::HashMap::new();
+    for name in xml_names {
+        let Ok(Some(data)) = lazy.read_limited(&name, craft_pptx::MAX_XML_PART as u64) else {
+            continue;
+        };
+        if let Ok(s) = std::str::from_utf8(&data)
+            && let Some(new_xml) = rewrite_svg_only_blip_xml(s)
+        {
+            rewritten.insert(name, new_xml.into_bytes());
+        }
+    }
+    if rewritten.is_empty() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
     let Ok(pkg) = craft_opc::Package::open(bytes, &craft_pptx::LIMITS) else {
         return std::borrow::Cow::Borrowed(bytes);
     };
-    let mut any_changed = false;
     let entries: Vec<(String, Vec<u8>)> = pkg
         .names()
         .filter_map(|name| {
-            let data = pkg.get(name)?;
-            if name.ends_with(".xml")
-                && let Ok(s) = std::str::from_utf8(data)
-                && let Some(rewritten) = rewrite_svg_only_blip_xml(s)
-            {
-                any_changed = true;
-                return Some((name.to_string(), rewritten.into_bytes()));
+            let key = name.trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
+            if let Some(updated) = rewritten.get(&key) {
+                return Some((name.to_string(), updated.clone()));
             }
-            Some((name.to_string(), data.to_vec()))
+            Some((name.to_string(), pkg.get(name)?.to_vec()))
         })
         .collect();
-    if !any_changed {
-        return std::borrow::Cow::Borrowed(bytes);
-    }
     craft_opc::zip_entries(&entries).map(std::borrow::Cow::Owned).unwrap_or(std::borrow::Cow::Borrowed(bytes))
 }
 
@@ -1538,5 +1571,34 @@ mod shape_owner_scoping_tests {
         let child_adjs = [(11_u32, &[3_000_000_000.0_f64][..])];
         let patched = String::from_utf8(super::patch_large_geom_adjs(xml.as_bytes(), &child_adjs)).expect("utf8");
         assert!(patched.contains(r#"fmla="val 3000000000""#), "child id=11 should be patched: {patched}");
+    }
+}
+
+#[cfg(test)]
+mod svg_only_blip_tests {
+    #![allow(clippy::expect_used)]
+
+    use std::borrow::Cow;
+
+    #[test]
+    fn rewrites_bare_and_attributed_svg_only_blips_without_touching_raster_blips() {
+        let bare = r#"<p:blipFill><a:blip><a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip r:embed="rId3"/></a:ext></a:extLst></a:blip></p:blipFill>"#;
+        let out = super::rewrite_svg_only_blip_xml(bare).expect("bare rewrite");
+        assert!(out.contains(r#"<a:blip r:embed="rId3">"#), "{out}");
+
+        let attributed = r#"<p:blipFill><a:blip cstate="print"><a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip r:embed="rId7"/></a:ext></a:extLst></a:blip></p:blipFill>"#;
+        let out = super::rewrite_svg_only_blip_xml(attributed).expect("attributed rewrite");
+        assert!(out.contains(r#"<a:blip r:embed="rId7" cstate="print">"#), "{out}");
+
+        let with_raster = r#"<p:blipFill><a:blip r:embed="rId1"><a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip r:embed="rId2"/></a:ext></a:extLst></a:blip></p:blipFill>"#;
+        assert_eq!(super::rewrite_svg_only_blip_xml(with_raster), None);
+    }
+
+    #[test]
+    fn normalize_skips_repacking_when_no_svg_only_blips_exist() {
+        let p = deckcraft_model::Presentation::default();
+        let bytes = crate::export(&p).expect("export");
+        let res = super::normalize_svg_only_blips(&bytes);
+        assert!(matches!(res, Cow::Borrowed(_)), "clean package must stay borrowed without repacking");
     }
 }

@@ -3,7 +3,7 @@ use super::geometry::{
 };
 use super::opts::{RenderOpts, ShapeState, SlideFields};
 use super::raster::Image;
-use super::slide::{SlidePart, needs_filters, output_size};
+use super::slide::{SlidePart, needs_filters, needs_filters_part, output_size};
 use super::stroke::{arrowheads, head_trims, stroke, trim_ends};
 use super::text_draw::{draw_layout_with, draw_text, line_bounds, preview_empty_bullets, prompt_body, text_transform, text_warp};
 use super::*;
@@ -186,7 +186,7 @@ impl Renderer {
         self.shadow_work = 0;
         self.skip = None;
         self.in_shadow_pass = false;
-        let (mut ctx, w, h, view) = Self::canvas(pres, opts, needs_filters(pres, slide));
+        let (mut ctx, w, h, view) = Self::canvas(pres, opts, needs_filters_part(pres, slide, Some(part)));
         let f = Frame { pres, opts, fields: Self::fields(pres, index, opts) };
         if let Some(rctx) = Ctx::for_slide(pres, slide) {
             match part {

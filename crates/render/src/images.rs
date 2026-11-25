@@ -118,19 +118,22 @@ fn duotone_rgb(a: &PictureAdjust) -> Option<(deckcraft_color::Rgba, deckcraft_co
     Some((rgb(d, deckcraft_color::Rgba::BLACK), rgb(l, deckcraft_color::Rgba::WHITE)))
 }
 
-/// Decode encoded bytes (PNG, JPEG, GIF, WebP, BMP, TIFF; WMF and EMF drawn at
+/// Decode encoded bytes (PNG, JPEG, GIF, WebP, BMP, TIFF; WMF, EMF and SVG drawn at
 /// [`crate::metafile::DEFAULT_SIDE`]) to straight RGBA.
 pub fn decode(bytes: &[u8]) -> Option<image::RgbaImage> {
     decode_at(bytes, crate::metafile::DEFAULT_SIDE)
 }
 
-/// [`decode`], with a metafile drawn with its longer side `side` px.
+/// [`decode`], with a vector picture (metafile or SVG) drawn with its longer side `side` px.
 fn decode_at(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
     if bytes.len() > 512 << 20 {
         return None;
     }
     if crate::metafile::is_metafile(bytes) {
         return crate::metafile::rasterize(bytes, side);
+    }
+    if crate::svg::is_svg(bytes) {
+        return crate::svg::rasterize(bytes, side);
     }
     decode_raster(bytes, MAX_RGBA)
 }
@@ -184,6 +187,9 @@ fn decode_raster(bytes: &[u8], max: u64) -> Option<image::RgbaImage> {
 pub fn natural_size(bytes: &[u8]) -> Option<(f64, f64)> {
     if crate::metafile::is_metafile(bytes) {
         return None;
+    }
+    if crate::svg::is_svg(bytes) {
+        return crate::svg::natural_size(bytes);
     }
     let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
     if w == 0 || h == 0 {
@@ -709,5 +715,14 @@ mod tests {
         let a = decode_anim(&out, &PictureAdjust::default()).expect("animated");
         assert_eq!(a.frames.len(), GIF_MAX_FRAMES);
         assert_eq!(a.ends.len(), GIF_MAX_FRAMES);
+    }
+
+    #[test]
+    fn decodes_svg_pictures_at_requested_size() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect width="200" height="100" fill="#123456"/></svg>"##;
+        assert_eq!(natural_size(svg), Some((200.0, 100.0)));
+        let img = decode_at(svg, 64).expect("svg decode");
+        assert_eq!(img.dimensions(), (64, 32));
+        assert_eq!(img.get_pixel(32, 16).0, [0x12, 0x34, 0x56, 0xff]);
     }
 }

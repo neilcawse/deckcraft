@@ -16,6 +16,11 @@ pub fn panics_caught() -> u64 {
 
 /// Does anything on this slide (or its layout/master graphics) use blur-based effects?
 pub fn needs_filters(pres: &Presentation, slide: &Slide) -> bool {
+    needs_filters_part(pres, slide, None)
+}
+
+/// Like [`needs_filters`], scoped to one [`SlidePart`] when `part` is `Some`.
+pub(crate) fn needs_filters_part(pres: &Presentation, slide: &Slide, part: Option<SlidePart>) -> bool {
     let Some(rctx) = Ctx::for_slide(pres, slide) else { return false };
     let mut any = false;
     let mut check = |shapes: &[Shape]| {
@@ -29,11 +34,15 @@ pub fn needs_filters(pres: &Presentation, slide: &Slide) -> bool {
             }
         });
     };
-    check(&slide.shapes);
-    if let Some(l) = rctx.layout {
-        check(&l.shapes);
+    if part != Some(SlidePart::Backdrop) {
+        check(&slide.shapes);
     }
-    check(&rctx.master.shapes);
+    if part != Some(SlidePart::Content) {
+        if let Some(l) = rctx.layout {
+            check(&l.shapes);
+        }
+        check(&rctx.master.shapes);
+    }
     any
 }
 

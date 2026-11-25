@@ -185,7 +185,8 @@ pub fn circle_gradient(focus: [f64; 4], bounds: Rect, tile: Rect) -> peniko::Gra
 /// Draw a picture fill into `bounds` (shape-local) honouring crop and stretch/tile modes; an animated
 /// GIF shows its frame at `gif_time` seconds.
 pub fn picture(ctx: &mut RenderContext, pres: &Presentation, pf: &PictureFill, bounds: Rect, m: Affine, gif_time: Option<f64>) {
-    let Some(item) = pres.media(pf.media) else {
+    let item = pres.media(pf.media).or_else(|| pf.svg_media.and_then(|id| pres.media(id)));
+    let Some(item) = item else {
         missing(ctx, bounds);
         return;
     };
@@ -207,7 +208,10 @@ pub fn picture(ctx: &mut RenderContext, pres: &Presentation, pf: &PictureFill, b
     // of it, magnified (#762).
     let want = (dest.width().abs().max(dest.height().abs()) * px_scale).max(1.0);
     let frame = gif_time.and_then(|t| images::gif_pixmap(&item.data, &pf.adjust, t));
-    let Some(pm) = frame.or_else(|| images::decode_for(&item.data, want, &pf.adjust)) else {
+    let decoded = frame.or_else(|| images::decode_for(&item.data, want, &pf.adjust)).or_else(|| {
+        pf.svg_media.filter(|&id| id != item.id).and_then(|id| pres.media(id)).and_then(|svg| images::decode_for(&svg.data, want, &pf.adjust))
+    });
+    let Some(pm) = decoded else {
         missing(ctx, bounds);
         return;
     };

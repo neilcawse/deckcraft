@@ -1424,6 +1424,7 @@ dependencies = [
  "krilla",
  "kurbo",
  "log",
+ "rayon",
  "serde",
  "thiserror 2.0.21",
  "wasm-bindgen-test",
@@ -1469,6 +1470,7 @@ name = "deckcraft-render"
 version = "0.19.0"
 dependencies = [
  "craft-metafile",
+ "craft-xml",
  "deckcraft-anim",
  "deckcraft-color",
  "deckcraft-fonts",

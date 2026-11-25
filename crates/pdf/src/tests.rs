@@ -7,8 +7,9 @@ use deckcraft_render::RenderOpts;
 use kurbo::Rect;
 
 use super::{
-    MAX_RASTER_PIXELS, PAPERS, PageLayout, PdfError, PdfOptions, Presentation, export, fill_clear, glyph_text_ranges, handout_boxes,
-    master_text_pieces, master_texts, notes_frames, notes_slide_box, opaque, paper_size, raster_scale, straight,
+    BASE_RASTER_PIXELS, MAX_RASTER_PIXELS_CEIL, PAPERS, PageLayout, PdfError, PdfOptions, Presentation, export, fill_clear, glyph_text_ranges,
+    handout_boxes, master_text_pieces, master_texts, notes_frames, notes_slide_box, opaque, page_chunk_size, paper_size, raster_pixel_cap,
+    raster_scale, straight,
 };
 use deckcraft_model::text::TextBody;
 
@@ -729,10 +730,11 @@ fn glyph_ranges_follow_shaping_clusters() {
 
 #[test]
 fn raster_scale_caps_total_pixels_not_each_side() {
-    // A huge square slide at 600 dpi would be 16,000 x 16,000 px (~1 GB RGBA) without the cap.
+    // A huge square slide at 600 dpi would be 166,667 x 166,667 px without the cap.
     let s = raster_scale(20_000.0, (20_000.0, 20_000.0), 600.0);
     let px = 20_000.0 * s * 20_000.0 * s;
-    assert!(px <= MAX_RASTER_PIXELS * 1.0001, "{px}");
+    assert!(px <= raster_pixel_cap(600.0) * 1.0001, "{px}");
+    assert!(px <= MAX_RASTER_PIXELS_CEIL * 1.0001, "{px}");
     // A normal slide keeps the requested dpi.
     let s = raster_scale(720.0, (960.0, 540.0), 200.0);
     assert!((s - 720.0 / 72.0 * 200.0 / 960.0).abs() < 1e-12);
@@ -750,4 +752,82 @@ fn huge_paper_and_long_notes_export_in_bounded_work() {
     Arc::make_mut(&mut p.slides[0]).notes = TextBody::from_text(&"ab ".repeat(20_000));
     let bytes = export(&p, &opts(PageLayout::Notes)).expect("export");
     assert!(bytes.starts_with(b"%PDF-"));
+}
+
+#[test]
+fn backdrop_key_reuses_shared_layout_and_distinguishes_slidenum_fields() {
+    use crate::backdrop_key;
+    use deckcraft_model::text::{Paragraph, Run, RunKind, RunProps};
+    use deckcraft_model::{Shape, ShapeId, Xfrm};
+
+    let p = deck(3);
+    assert_eq!(backdrop_key(&p, 0, 1.0), backdrop_key(&p, 1, 1.0));
+    assert_eq!(backdrop_key(&p, 1, 1.0), backdrop_key(&p, 2, 1.0));
+
+    // A non-placeholder master shape containing a slidenum field must give each slide its own key.
+    let mut p_num = deck(2);
+    let mut tb = TextBody::default();
+    tb.paragraphs.push(Paragraph {
+        runs: vec![Run { kind: RunKind::Field { field: "slidenum".into() }, text: "#".into(), props: RunProps::default() }],
+        ..Default::default()
+    });
+    Arc::make_mut(&mut p_num.masters[0]).shapes.push(Shape {
+        id: ShapeId(9901),
+        xfrm: Some(Xfrm::new(10.0, 10.0, 40.0, 20.0)),
+        text: Some(tb),
+        ..Default::default()
+    });
+    assert_ne!(backdrop_key(&p_num, 0, 1.0), backdrop_key(&p_num, 1, 1.0));
+}
+
+#[test]
+fn split_content_over_backdrop_handles_transparent_partial_and_opaque() {
+    use crate::{BackdropPixels, split_content_over_backdrop};
+
+    // All-transparent front produces None (pure backdrop slide).
+    assert!(split_content_over_backdrop(&[0, 0, 0, 0, 0, 0, 0, 0], &BackdropPixels::Solid([240, 245, 250])).is_none());
+
+    // Mixed transparency fills a==0 with backdrop RGB and unpremultiplies partial alpha.
+    let front = [0, 0, 0, 0, 10, 20, 30, 255, 64, 32, 0, 128];
+    let (rgb, alpha) = split_content_over_backdrop(&front, &BackdropPixels::Solid([200, 210, 220])).expect("mixed");
+    assert_eq!(alpha, Some(vec![0, 255, 128]));
+    assert_eq!(&rgb[0..3], &[200, 210, 220]);
+    assert_eq!(&rgb[3..6], &[10, 20, 30]);
+    assert_eq!(&rgb[6..9], &[128, 64, 0]);
+
+    // Fully opaque front omits alpha channel (no SMask needed).
+    let opaque_front = [10, 20, 30, 255, 40, 50, 60, 255];
+    let (rgb, alpha) = split_content_over_backdrop(&opaque_front, &BackdropPixels::Solid([0, 0, 0])).expect("opaque");
+    assert_eq!(alpha, None);
+    assert_eq!(rgb, vec![10, 20, 30, 40, 50, 60]);
+}
+#[test]
+fn raster_scale_honors_600dpi_and_caps_stage_decks_with_dynamic_chunks() {
+    // Standard 16:9 at 300 dpi (9M px) stays uncapped.
+    let s_16x9_300 = raster_scale(960.0, (960.0, 540.0), 300.0);
+    assert!((s_16x9_300 - 300.0 / 72.0).abs() < 1e-12);
+
+    // Standard 16:9 (960x540 pt) at 600 dpi produces full 8000x4500 (36M px).
+    let s_16x9_600 = raster_scale(960.0, (960.0, 540.0), 600.0);
+    assert!((s_16x9_600 - 600.0 / 72.0).abs() < 1e-12);
+    assert_eq!(((960.0 * s_16x9_600).round() as u32, (540.0 * s_16x9_600).round() as u32), (8000, 4500));
+
+    // 4:3 (720x540 pt) at 400 dpi produces full 4000x3000 (12M px).
+    let s_4x3_400 = raster_scale(720.0, (720.0, 540.0), 400.0);
+    assert!((s_4x3_400 - 400.0 / 72.0).abs() < 1e-12);
+    assert_eq!(((720.0 * s_4x3_400).round() as u32, (540.0 * s_4x3_400).round() as u32), (4000, 3000));
+
+    // Wide stage deck (4032x1296 pt = 56"x18") at 150 and 300 dpi stays capped at <= 9M px.
+    for dpi in [150.0, 200.0, 300.0] {
+        let s_stage = raster_scale(4032.0, (4032.0, 1296.0), dpi);
+        let px = 4032.0 * s_stage * 1296.0 * s_stage;
+        assert!(px <= BASE_RASTER_PIXELS * 1.0001, "dpi={dpi}: {px}");
+        assert!(px >= BASE_RASTER_PIXELS * 0.99, "dpi={dpi}: {px}");
+    }
+
+    // Dynamic parallel chunk size drops to 2 at 36M px/slide (600 dpi 16:9) and stays 8 at <= 9M px.
+    assert_eq!(page_chunk_size(36_000_000), 2);
+    assert_eq!(page_chunk_size(9_000_000), 8);
+    assert_eq!(page_chunk_size(4_000_000), 8);
+    assert_eq!(page_chunk_size(64_000_000), 1);
 }

@@ -11,19 +11,21 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Weak};
 
 use craft_pdf::write::{self, Metadata, Writer, backend as krilla};
 
 use deckcraft_fonts::FontDb;
 use deckcraft_model::Presentation;
-use deckcraft_model::text::{Action as ClickAction, safe_url};
-use deckcraft_render::{PlacedText, RenderOpts};
+use deckcraft_model::text::{Action as ClickAction, RunKind, safe_url};
+use deckcraft_render::{Placed, PlacedText, RenderOpts};
 use krilla::action::{Action, LinkAction};
 use krilla::annotation::{Annotation, LinkAnnotation, Target};
 use krilla::destination::XyzDestination;
 use krilla::geom::{Point, Size, Transform};
-use krilla::image::Image;
+use krilla::image::{BitsPerComponent, CustomImage, Image, ImageColorspace};
 use krilla::num::NormalizedF32;
 use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
@@ -32,7 +34,6 @@ use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph, TextDirection};
 use kurbo::{Affine, Rect};
 use serde::{Deserialize, Serialize};
-
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {
     #[error("nothing to export (no slides in range)")]
@@ -66,7 +67,7 @@ pub enum PageLayout {
 #[serde(default, rename_all = "camelCase")]
 pub struct PdfOptions {
     pub layout: PageLayout,
-    /// Raster resolution of slide artwork (dots per inch), lowered for a slide whose raster would pass 64M pixels.
+    /// Raster resolution of slide artwork (dots per inch, clamped to 36–600 dpi), lowered when a slide exceeds its DPI pixel budget (up to 64M pixels).
     pub dpi: f64,
     /// Slide indices to export (0-based); `None` = all.
     pub slides: Option<Vec<usize>>,
@@ -178,6 +179,9 @@ fn export_inner(pres: &Presentation, opts: &PdfOptions) -> Result<Vec<u8>> {
     let pdf = writer.document_mut();
 
     let (sw, sh) = (pres.slide_size.width.max(1.0), pres.slide_size.height.max(1.0));
+    // One clock reading for the whole export so backdrops sharing a layout reuse their raster
+    // and a date field cannot differ between the raster and text layer.
+    let now = deckcraft_text::datetime::DateTime::now_local();
     let mut ex = Exporter { pres, opts, fonts: HashMap::new(), backdrops: Backdrops::default() };
     // Page plan: per page, the slides on it with their boxes (page points).
     let pages = plan_pages(pres, opts, &slides, sw, sh);
@@ -185,44 +189,57 @@ fn export_inner(pres: &Presentation, opts: &PdfOptions) -> Result<Vec<u8>> {
     let page_of: HashMap<usize, usize> = pages.iter().enumerate().flat_map(|(p, v)| v.iter().map(move |(i, _)| (*i, p))).collect();
     pdf.set_outline(build_outline(pres, &pages));
 
-    for v in &pages {
-        let (pw, ph) = match opts.layout {
-            PageLayout::Slides => (sw, sh),
-            _ => opts.paper,
-        };
-        let size = Size::from_wh(pw as f32, ph as f32).ok_or(PdfError::NoPages)?;
-        let mut page = pdf.start_page_with(PageSettings::new(size));
-        let mut annots = Vec::new();
-        {
-            let mut s = page.surface();
-            for (i, b) in v {
-                ex.slide(&mut s, *i, *b)?;
-                annots.extend(ex.links(*i, *b, &page_of));
-            }
-            match opts.layout {
-                PageLayout::Notes => {
-                    if let Some((i, _)) = v.first() {
-                        let notes = pres.slides[*i].notes_text();
-                        ex.paragraphs(&mut s, &notes, notes_frames(pres, opts.paper).1, 12.0)?;
-                    }
-                    ex.page_texts(&mut s, pres.notes_master.as_deref(), pw, ph, v.first().map(|x| x.0 + 1).unwrap_or(1))?;
+    let page_px: usize = pages.first().map_or(1, |v| {
+        v.iter()
+            .map(|(_, b)| {
+                let s = raster_scale(b.width(), (sw, sh), opts.dpi);
+                ((sw * s) * (sh * s)).round() as usize
+            })
+            .sum::<usize>()
+            .max(1)
+    });
+    let chunk_size = page_chunk_size(page_px);
+    for page_chunk in pages.chunks(chunk_size) {
+        let prepared = prepare_page_chunk(pres, opts, page_chunk, (sw, sh), now, &mut ex.backdrops);
+        for (v, slides_ready) in page_chunk.iter().zip(prepared) {
+            let (pw, ph) = match opts.layout {
+                PageLayout::Slides => (sw, sh),
+                _ => opts.paper,
+            };
+            let size = Size::from_wh(pw as f32, ph as f32).ok_or(PdfError::NoPages)?;
+            let mut page = pdf.start_page_with(PageSettings::new(size));
+            let mut annots = Vec::new();
+            {
+                let mut s = page.surface();
+                for ((i, b), ready) in v.iter().zip(slides_ready) {
+                    ex.draw_prepared_slide(&mut s, *b, &ready)?;
+                    annots.extend(ex.links_from(*i, *b, &page_of, &ready.placed));
                 }
-                PageLayout::Handouts { per_page } => {
-                    if per_page == 3 {
-                        for (_, b) in v {
-                            ex.note_lines(&mut s, Rect::new(b.x1 + 24.0, b.y0, pw - 54.0, b.y1));
+                match opts.layout {
+                    PageLayout::Notes => {
+                        if let Some((i, _)) = v.first() {
+                            let notes = pres.slides[*i].notes_text();
+                            ex.paragraphs(&mut s, &notes, notes_frames(pres, opts.paper).1, 12.0)?;
                         }
+                        ex.page_texts(&mut s, pres.notes_master.as_deref(), pw, ph, v.first().map(|x| x.0 + 1).unwrap_or(1))?;
                     }
-                    ex.page_texts(&mut s, pres.handout_master.as_deref(), pw, ph, page_of.get(&v[0].0).map(|p| p + 1).unwrap_or(1))?;
+                    PageLayout::Handouts { per_page } => {
+                        if per_page == 3 {
+                            for (_, b) in v {
+                                ex.note_lines(&mut s, Rect::new(b.x1 + 24.0, b.y0, pw - 54.0, b.y1));
+                            }
+                        }
+                        ex.page_texts(&mut s, pres.handout_master.as_deref(), pw, ph, page_of.get(&v[0].0).map(|p| p + 1).unwrap_or(1))?;
+                    }
+                    PageLayout::Slides => {}
                 }
-                PageLayout::Slides => {}
+                s.finish();
             }
-            s.finish();
+            for a in annots {
+                page.add_annotation(a);
+            }
+            page.finish();
         }
-        for a in annots {
-            page.add_annotation(a);
-        }
-        page.finish();
     }
     writer.finish().map_err(Into::into)
 }
@@ -405,6 +422,7 @@ fn grey(v: u8, opacity: f32) -> Fill {
 
 /// Premultiplied RGBA (the renderer's pixels) to the straight RGBA the writer stores. Runs of
 /// pixels that are all fully transparent or fully opaque, most of a slide, are skipped in blocks.
+#[cfg(test)]
 fn straight(rgba: &mut [u8]) {
     let (blocks, rest) = rgba.as_chunks_mut::<64>();
     for block in blocks {
@@ -415,6 +433,7 @@ fn straight(rgba: &mut [u8]) {
     straight_px(rest);
 }
 
+#[cfg(test)]
 fn straight_px(rgba: &mut [u8]) {
     for px in rgba.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
@@ -450,6 +469,7 @@ fn opaque_px(rgba: &mut [u8]) {
 /// Gives every fully transparent content pixel the backdrop's colour. The renderer leaves them
 /// RGB 0,0,0; a viewer that smooths the image blends colour and mask separately, so the black
 /// shows as a grey hairline around white pictures and shapes (#1455).
+#[cfg(test)]
 fn fill_clear(front: &mut [u8], back: &[u8]) {
     for (f, b) in front.as_chunks_mut::<4>().0.iter_mut().zip(back.as_chunks::<4>().0) {
         if f[3] == 0 {
@@ -458,50 +478,440 @@ fn fill_clear(front: &mut [u8], back: &[u8]) {
     }
 }
 
-/// Most bytes of opaque backdrop rasters kept to recognise a backdrop seen before.
-const BACKDROP_CACHE_BYTES: usize = 32 << 20;
+/// Most bytes of full-frame backdrop RGB kept for `fill_clear` when slides reuse a non-solid
+/// backdrop. Solid backdrops take 3 bytes; encoded PDF XObject handles are kept for all slides.
+const BACKDROP_CACHE_BYTES: usize = 128 << 20;
 
-/// Backdrops already handed to the writer, most recent first, with their pixels. Slides that
-/// share a layout render the same backdrop; reusing its image skips hashing and compressing the
-/// raster again, and the writer stores it once either way (#845).
-#[derive(Default)]
-struct Backdrops(Vec<(Vec<u8>, u32, u32, Image)>);
+/// Maximum pages prepared together per parallel chunk; actual chunk size is dynamically bounded
+/// by [`IN_FLIGHT_PIXEL_BUDGET`] so peak raster RAM stays bounded even at 600 dpi.
+const MAX_PAGE_CHUNK: usize = 8;
+/// Total in-flight slide pixels prepared in parallel per chunk (e.g. 2 slides at 36M px/slide,
+/// up to 8 at standard DPI).
+const IN_FLIGHT_PIXEL_BUDGET: usize = 72_000_000;
 
-impl Backdrops {
-    fn image(&mut self, mut img: deckcraft_render::Image) -> Image {
-        opaque(&mut img.pixels);
-        let (w, h) = (img.width, img.height);
-        if let Some(i) = self.0.iter().position(|(px, pw, ph, _)| (*pw, *ph) == (w, h) && *px == img.pixels) {
-            let hit = self.0.remove(i);
-            let image = hit.3.clone();
-            self.0.insert(0, hit);
-            return image;
-        }
-        if img.pixels.len() > BACKDROP_CACHE_BYTES {
-            return Image::from_rgba8(img.pixels, w, h);
-        }
-        let image = Image::from_rgba8(img.pixels.clone(), w, h);
-        self.0.insert(0, (img.pixels, w, h, image.clone()));
-        let mut total = 0;
-        self.0.retain(|(px, ..)| {
-            total += px.len();
-            total <= BACKDROP_CACHE_BYTES
-        });
-        image
+#[derive(Clone)]
+struct RawImage {
+    rgb: Arc<Vec<u8>>,
+    alpha: Option<Arc<Vec<u8>>>,
+    size: (u32, u32),
+    hash: (u64, u64),
+}
+
+impl Hash for RawImage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.size.hash(state);
+        self.alpha.is_some().hash(state);
+        self.hash.hash(state);
     }
 }
 
-/// Most pixels one slide raster may have; it is RGBA, and the backdrop and the content are two rasters.
-const MAX_RASTER_PIXELS: f64 = 64_000_000.0;
+impl CustomImage for RawImage {
+    fn color_channel(&self) -> &[u8] {
+        &self.rgb
+    }
+    fn alpha_channel(&self) -> Option<&[u8]> {
+        self.alpha.as_deref().map(Vec::as_slice)
+    }
+    fn bits_per_component(&self) -> BitsPerComponent {
+        BitsPerComponent::Eight
+    }
+    fn size(&self) -> (u32, u32) {
+        self.size
+    }
+    fn icc_profile(&self) -> Option<&[u8]> {
+        None
+    }
+    fn color_space(&self) -> ImageColorspace {
+        ImageColorspace::Rgb
+    }
+}
+
+fn hash_bytes_128(bytes: &[u8]) -> (u64, u64) {
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h1);
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    0x9e37_79b9_7f4a_7c15_u64.hash(&mut h2);
+    bytes.len().hash(&mut h2);
+    let (chunks, tail) = bytes.as_chunks::<8>();
+    for c in chunks {
+        h2.write_u64(u64::from_le_bytes(*c).rotate_left(13) ^ 0xa076_1d64_78bd_642f);
+    }
+    h2.write(tail);
+    (h1.finish(), h2.finish())
+}
+
+fn rgb_image(rgb: Arc<Vec<u8>>, alpha: Option<Arc<Vec<u8>>>, w: u32, h: u32, hash: (u64, u64)) -> Option<Image> {
+    Image::from_custom(RawImage { rgb, alpha, size: (w, h), hash }, false).ok()
+}
+
+#[derive(Clone)]
+enum BackdropPixels {
+    Solid([u8; 3]),
+    Rgb(Arc<Vec<u8>>),
+}
+
+#[derive(Clone)]
+enum BackdropRef {
+    Solid([u8; 3]),
+    Rgb(Weak<Vec<u8>>),
+}
+
+#[derive(Clone)]
+struct HashedBackdrop {
+    image: Image,
+    pixels: BackdropRef,
+}
+
+#[derive(Clone)]
+struct CachedBackdrop {
+    image: Image,
+    pixels: BackdropPixels,
+}
+
+/// Structural identity of a slide's backdrop (background + master/layout non-placeholder graphics)
+/// at a given render scale. Two slides with the same key produce identical backdrop pixels,
+/// so subsequent slides skip rendering `SlidePart::Backdrop` altogether.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BackdropKey {
+    layout: deckcraft_model::LayoutId,
+    show_master_shapes: bool,
+    color_map: Option<Vec<(String, String)>>,
+    background: Option<String>,
+    slide_num: Option<u32>,
+    scale_bits: u64,
+}
+fn text_has_slidenum(tb: &deckcraft_model::text::TextBody) -> bool {
+    tb.paragraphs.iter().any(|p| p.runs.iter().any(|r| matches!(&r.kind, RunKind::Field { field } if field.eq_ignore_ascii_case("slidenum"))))
+}
+
+fn shapes_have_slidenum(shapes: &[deckcraft_model::Shape]) -> bool {
+    let mut found = false;
+    deckcraft_model::walk(shapes, &mut |s, _| {
+        if found || s.ph.is_some() {
+            return;
+        }
+        if s.text.as_ref().is_some_and(text_has_slidenum) {
+            found = true;
+        } else if let deckcraft_model::ShapeKind::Table(t) = &s.kind
+            && t.rows.iter().any(|r| r.cells.iter().any(|c| text_has_slidenum(&c.text)))
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn backdrop_key(pres: &Presentation, index: usize, scale: f64) -> BackdropKey {
+    let slide = &pres.slides[index];
+    let scale_bits = if scale == 0.0 { 0.0_f64.to_bits() } else { scale.to_bits() };
+    let has_slidenum = deckcraft_model::resolve::Ctx::for_slide(pres, slide).is_some_and(|rctx| {
+        let (show_layout, show_master) = deckcraft_model::resolve::show_master_shapes(slide, rctx.layout);
+        (show_master && shapes_have_slidenum(&rctx.master.shapes)) || (show_layout && rctx.layout.is_some_and(|l| shapes_have_slidenum(&l.shapes)))
+    });
+    BackdropKey {
+        layout: slide.layout,
+        show_master_shapes: slide.show_master_shapes,
+        color_map: slide.color_map.clone(),
+        background: slide.background.as_ref().map(|b| format!("{b:?}")),
+        slide_num: has_slidenum.then(|| pres.slide_number(index)),
+        scale_bits,
+    }
+}
+
+/// Backdrops already rendered and handed to the writer.
+///
+/// - `by_key` avoids re-rendering `SlidePart::Backdrop` for slides that share a layout/background.
+/// - `by_hash` deduplicates identical rendered backdrops even across distinct layouts/overrides
+///   using a 128-bit digest plus exact pixel verification when the cached buffer is still resident,
+///   keeping only lightweight `krilla::Image` handles so large decks never lose deduplication.
+/// - Non-solid RGB pixel buffers kept for `fill_clear` are FIFO-bounded by `BACKDROP_CACHE_BYTES`.
+#[derive(Default)]
+struct Backdrops {
+    by_key: HashMap<BackdropKey, CachedBackdrop>,
+    by_hash: HashMap<(u32, u32, u64, u64), Vec<HashedBackdrop>>,
+    rgb_order: VecDeque<(BackdropKey, usize)>,
+    rgb_bytes: usize,
+}
+
+struct EncodedBackdrop {
+    w: u32,
+    h: u32,
+    hash: (u64, u64),
+    rgb: Arc<Vec<u8>>,
+    solid: Option<[u8; 3]>,
+}
+
+fn encode_backdrop(mut img: deckcraft_render::Image) -> Option<EncodedBackdrop> {
+    opaque(&mut img.pixels);
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut rgb = Vec::with_capacity((w as usize).saturating_mul(h as usize).saturating_mul(3));
+    let mut solid = img.pixels.get(0..3).map(|s| [s[0], s[1], s[2]]);
+    for px in img.pixels.as_chunks::<4>().0 {
+        let c = [px[0], px[1], px[2]];
+        if solid.is_some_and(|first| first != c) {
+            solid = None;
+        }
+        rgb.extend_from_slice(&c);
+    }
+    let hash = hash_bytes_128(&rgb);
+    Some(EncodedBackdrop { w, h, hash, rgb: Arc::new(rgb), solid })
+}
+
+impl Backdrops {
+    fn get(&self, key: &BackdropKey) -> Option<CachedBackdrop> {
+        self.by_key.get(key).cloned()
+    }
+
+    fn insert_encoded(&mut self, key: BackdropKey, enc: EncodedBackdrop) -> Option<CachedBackdrop> {
+        let bucket = self.by_hash.entry((enc.w, enc.h, enc.hash.0, enc.hash.1)).or_default();
+        let existing = bucket.iter().find(|cand| match (&cand.pixels, enc.solid) {
+            (BackdropRef::Solid(a), Some(b)) => *a == b,
+            (BackdropRef::Solid(_), None) | (BackdropRef::Rgb(_), Some(_)) => false,
+            (BackdropRef::Rgb(weak), None) => weak.upgrade().is_none_or(|buf| *buf == *enc.rgb),
+        });
+        let image = match existing {
+            Some(hit) => hit.image.clone(),
+            None => {
+                let created = rgb_image(enc.rgb.clone(), None, enc.w, enc.h, enc.hash)?;
+                let pref = match enc.solid {
+                    Some(c) => BackdropRef::Solid(c),
+                    None => BackdropRef::Rgb(Arc::downgrade(&enc.rgb)),
+                };
+                bucket.push(HashedBackdrop { image: created.clone(), pixels: pref });
+                created
+            }
+        };
+        let pixels = match enc.solid {
+            Some(c) => BackdropPixels::Solid(c),
+            None => BackdropPixels::Rgb(enc.rgb),
+        };
+        let entry = CachedBackdrop { image, pixels };
+        match &entry.pixels {
+            BackdropPixels::Solid(_) => {
+                self.by_key.insert(key, entry.clone());
+            }
+            BackdropPixels::Rgb(buf) => {
+                let len = buf.len();
+                if len <= BACKDROP_CACHE_BYTES {
+                    while self.rgb_bytes + len > BACKDROP_CACHE_BYTES
+                        && let Some((old_key, old_len)) = self.rgb_order.pop_front()
+                    {
+                        self.by_key.remove(&old_key);
+                        self.rgb_bytes = self.rgb_bytes.saturating_sub(old_len);
+                    }
+                    self.rgb_bytes += len;
+                    self.rgb_order.push_back((key.clone(), len));
+                    self.by_key.insert(key, entry.clone());
+                }
+            }
+        }
+        Some(entry)
+    }
+}
+
+/// Unpremultiplies `front` (premultiplied RGBA) into straight RGB + alpha channels in a single
+/// pass, filling fully transparent pixels with the backdrop's RGB colour (#1455). Returns `None`
+/// when every pixel is transparent (pure backdrop slide).
+fn split_content_over_backdrop(front: &[u8], back: &BackdropPixels) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let chunks = front.as_chunks::<4>().0;
+    if !chunks.iter().any(|px| px[3] != 0) {
+        return None;
+    }
+    let n = chunks.len();
+    let mut rgb = Vec::with_capacity(n * 3);
+    let mut alpha = Vec::with_capacity(n);
+    let mut all_opaque = true;
+    match back {
+        BackdropPixels::Solid(bg) => {
+            for px in chunks {
+                let a = px[3];
+                alpha.push(a);
+                if a == 0 {
+                    all_opaque = false;
+                    rgb.extend_from_slice(bg);
+                } else if a == 255 {
+                    rgb.extend_from_slice(&px[..3]);
+                } else {
+                    all_opaque = false;
+                    let au = a as u32;
+                    rgb.push((((px[0] as u32 * 255 + au / 2) / au).min(255)) as u8);
+                    rgb.push((((px[1] as u32 * 255 + au / 2) / au).min(255)) as u8);
+                    rgb.push((((px[2] as u32 * 255 + au / 2) / au).min(255)) as u8);
+                }
+            }
+        }
+        BackdropPixels::Rgb(bg_buf) => {
+            let bg_chunks = bg_buf.as_chunks::<3>().0;
+            for (idx, px) in chunks.iter().enumerate() {
+                let a = px[3];
+                alpha.push(a);
+                if a == 0 {
+                    all_opaque = false;
+                    let bg = bg_chunks.get(idx).copied().unwrap_or([255, 255, 255]);
+                    rgb.extend_from_slice(&bg);
+                } else if a == 255 {
+                    rgb.extend_from_slice(&px[..3]);
+                } else {
+                    all_opaque = false;
+                    let au = a as u32;
+                    rgb.push((((px[0] as u32 * 255 + au / 2) / au).min(255)) as u8);
+                    rgb.push((((px[1] as u32 * 255 + au / 2) / au).min(255)) as u8);
+                    rgb.push((((px[2] as u32 * 255 + au / 2) / au).min(255)) as u8);
+                }
+            }
+        }
+    }
+    Some((rgb, (!all_opaque).then_some(alpha)))
+}
+
+struct PreparedSlide {
+    backdrop: Option<Image>,
+    content: Option<Image>,
+    content_opaque: bool,
+    placed: Placed,
+}
+
+fn prepare_slide(
+    pres: &Presentation,
+    index: usize,
+    scale: f64,
+    now: Option<deckcraft_text::datetime::DateTime>,
+    backdrop: Option<&CachedBackdrop>,
+    threads: u16,
+) -> PreparedSlide {
+    let ropts = RenderOpts { scale, threads, now, ..Default::default() };
+    let front = deckcraft_render::render_slide_part(pres, index, deckcraft_render::SlidePart::Content, &ropts);
+    let mut content_opaque = false;
+    let content = backdrop.and_then(|back| {
+        let (w, h) = (front.width, front.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (rgb, alpha) = split_content_over_backdrop(&front.pixels, &back.pixels)?;
+        content_opaque = alpha.is_none();
+        // Per-slide content rasters are distinct per slide; use a unique tag to avoid hashing tens
+        // of megabytes of pixels on the render thread.
+        let tag = ((1u64 << 63) | (((index as u64) << 16) ^ ((w as u64) << 32) ^ (h as u64)), index as u64);
+        rgb_image(Arc::new(rgb), alpha.map(Arc::new), w, h, tag)
+    });
+    let placed = deckcraft_render::place_slide_with(pres, index, &ropts);
+    PreparedSlide { backdrop: backdrop.map(|b| b.image.clone()), content, content_opaque, placed }
+}
+
+fn prepare_page_chunk(
+    pres: &Presentation,
+    opts: &PdfOptions,
+    chunk: &[Vec<(usize, Rect)>],
+    slide_size: (f64, f64),
+    now: Option<deckcraft_text::datetime::DateTime>,
+    backdrops: &mut Backdrops,
+) -> Vec<Vec<PreparedSlide>> {
+    // Gather jobs for all slides in this chunk and identify uncached backdrops.
+    let mut jobs: Vec<(usize, f64, BackdropKey)> = Vec::new();
+    let mut missing_keys: Vec<(usize, f64, BackdropKey)> = Vec::new();
+    let mut seen_missing: HashSet<BackdropKey> = HashSet::new();
+    for page in chunk {
+        for (i, b) in page {
+            let scale = raster_scale(b.width(), slide_size, opts.dpi);
+            let key = backdrop_key(pres, *i, scale);
+            if backdrops.get(&key).is_none() && seen_missing.insert(key.clone()) {
+                missing_keys.push((*i, scale, key.clone()));
+            }
+            jobs.push((*i, scale, key));
+        }
+    }
+
+    // Render and RGB-encode missing backdrops (in parallel off wasm32 when there are several).
+    let rendered_backdrops: Vec<(BackdropKey, Option<EncodedBackdrop>)> = {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::{IntoParallelRefIterator as _, ParallelIterator as _};
+            let threads = if missing_keys.len() > 1 { 0 } else { 4 };
+            missing_keys
+                .par_iter()
+                .map(|(i, scale, key)| {
+                    let ropts = RenderOpts { scale: *scale, threads, now, ..Default::default() };
+                    let img = deckcraft_render::render_slide_part(pres, *i, deckcraft_render::SlidePart::Backdrop, &ropts);
+                    (key.clone(), encode_backdrop(img))
+                })
+                .collect()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            missing_keys
+                .iter()
+                .map(|(i, scale, key)| {
+                    let ropts = RenderOpts { scale: *scale, threads: 0, now, ..Default::default() };
+                    let img = deckcraft_render::render_slide_part(pres, *i, deckcraft_render::SlidePart::Backdrop, &ropts);
+                    (key.clone(), encode_backdrop(img))
+                })
+                .collect()
+        }
+    };
+    let mut local_backdrops: HashMap<BackdropKey, CachedBackdrop> = HashMap::new();
+    for (key, enc) in rendered_backdrops {
+        if let Some(enc) = enc
+            && let Some(cached) = backdrops.insert_encoded(key.clone(), enc)
+        {
+            local_backdrops.insert(key, cached);
+        }
+    }
+
+    let job_backdrops: Vec<Option<CachedBackdrop>> =
+        jobs.iter().map(|(_, _, key)| backdrops.get(key).or_else(|| local_backdrops.get(key).cloned())).collect();
+
+    // Render slide contents & text/link placement (in parallel across the chunk off wasm32).
+    let flat: Vec<PreparedSlide> = {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::{IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _};
+            let threads = if jobs.len() > 1 { 0 } else { 4 };
+            jobs.par_iter()
+                .zip(job_backdrops.par_iter())
+                .map(|((i, scale, _), back)| prepare_slide(pres, *i, *scale, now, back.as_ref(), threads))
+                .collect()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            jobs.iter().zip(job_backdrops.iter()).map(|((i, scale, _), back)| prepare_slide(pres, *i, *scale, now, back.as_ref(), 0)).collect()
+        }
+    };
+
+    let mut it = flat.into_iter();
+    chunk.iter().map(|page| it.by_ref().take(page.len()).collect()).collect()
+}
+
+/// Base pixel budget per slide raster at <= 300 dpi: 9M pixels preserves full 300 dpi on standard
+/// 16:9 (9.0M px) and Letter (8.4M px) slides while keeping giant stage decks (56"×18") at ~4K–5K.
+/// Above 300 dpi the cap scales proportionally to `(dpi / 300)^2` up to `MAX_RASTER_PIXELS_CEIL`
+/// (64M px) so explicit high-DPI exports honor the documented 36–600 dpi contract.
+const BASE_RASTER_PIXELS: f64 = 9_000_000.0;
+const MAX_RASTER_PIXELS_CEIL: f64 = 64_000_000.0;
 
 /// Most ruled note lines one handout area gets (a letter page holds about 30).
 const MAX_NOTE_LINES: usize = 500;
 
+/// Per-slide pixel budget for `dpi` (already clamped or unclamped).
+fn raster_pixel_cap(dpi: f64) -> f64 {
+    let clamped = dpi.clamp(36.0, 600.0);
+    if clamped > 300.0 { (BASE_RASTER_PIXELS * (clamped / 300.0).powi(2)).min(MAX_RASTER_PIXELS_CEIL) } else { BASE_RASTER_PIXELS }
+}
+
+/// Number of pages to prepare concurrently given `slide_px` pixels per page.
+fn page_chunk_size(slide_px: usize) -> usize {
+    (IN_FLIGHT_PIXEL_BUDGET / slide_px.max(1)).clamp(1, MAX_PAGE_CHUNK)
+}
+
 /// Render scale for a slide of `slide` units drawn `box_width` points wide at `dpi`, with the total pixel count capped.
 fn raster_scale(box_width: f64, slide: (f64, f64), dpi: f64) -> f64 {
-    let scale = (box_width / 72.0 * dpi.clamp(36.0, 600.0)) / slide.0;
+    let clamped = dpi.clamp(36.0, 600.0);
+    let scale = (box_width / 72.0 * clamped) / slide.0;
+    let cap = raster_pixel_cap(clamped);
     let pixels = slide.0 * scale * slide.1 * scale;
-    if pixels > MAX_RASTER_PIXELS { scale * (MAX_RASTER_PIXELS / pixels).sqrt() } else { scale }
+    if pixels > cap { scale * (cap / pixels).sqrt() } else { scale }
 }
 
 impl Exporter<'_> {
@@ -514,37 +924,20 @@ impl Exporter<'_> {
         Ok(font)
     }
 
-    /// Slide `i` drawn into `b` (page points).
-    fn slide(&mut self, s: &mut Surface, i: usize, b: Rect) -> Result<()> {
+    /// Draw a prepared slide into `b` (page points).
+    fn draw_prepared_slide(&mut self, s: &mut Surface, b: Rect, ready: &PreparedSlide) -> Result<()> {
         let pres = self.pres;
-        let (sw, sh) = (pres.slide_size.width.max(1.0), pres.slide_size.height.max(1.0));
+        let sw = pres.slide_size.width.max(1.0);
         let k = b.width() / sw;
-        // Raster at the requested dpi relative to the box size on paper.
-        let scale = raster_scale(b.width(), (sw, sh), self.opts.dpi);
-        // One clock reading for the raster and the text layer, so a date field cannot differ between them.
-        let ropts = RenderOpts { scale, threads: 4, now: deckcraft_text::datetime::DateTime::now_local(), ..Default::default() };
-        // Two rasters per slide: the backdrop (background, master and layout graphics) is the same
-        // on every slide that shares its layout, so the writer stores it once, and the slide's own
-        // shapes draw over it (#845).
-        let mut back = deckcraft_render::render_slide_part(pres, i, deckcraft_render::SlidePart::Backdrop, &ropts);
-        opaque(&mut back.pixels);
-        let front = deckcraft_render::render_slide_part(pres, i, deckcraft_render::SlidePart::Content, &ropts);
-        let (w, h) = (back.width, back.height);
-        if w > 0
-            && h > 0
-            && let Some(size) = Size::from_wh(b.width() as f32, b.height() as f32)
-        {
+        if let Some(size) = Size::from_wh(b.width() as f32, b.height() as f32) {
             s.push_transform(&Transform::from_translate(b.x0 as f32, b.y0 as f32));
-            // Taken, not copied: a print-resolution slide is ~16 MB.
-            let mut rgba = front.pixels;
-            let content = rgba.as_chunks::<4>().0.iter().any(|px| px[3] != 0);
-            if content {
-                fill_clear(&mut rgba, &back.pixels);
-                straight(&mut rgba);
+            if !ready.content_opaque
+                && let Some(back) = &ready.backdrop
+            {
+                s.draw_image(back.clone(), size);
             }
-            s.draw_image(self.backdrops.image(back), size);
-            if content {
-                s.draw_image(Image::from_rgba8(rgba, w, h), size);
+            if let Some(front) = &ready.content {
+                s.draw_image(front.clone(), size);
             }
             s.pop();
         }
@@ -563,10 +956,9 @@ impl Exporter<'_> {
         }
         if self.opts.text_layer {
             let view = Affine::translate((b.x0, b.y0)) * Affine::scale(k);
-            for pt in deckcraft_render::place_slide_with(pres, i, &ropts).texts {
-                self.text_layer(s, &pt, view, false)?;
+            for pt in &ready.placed.texts {
+                self.text_layer(s, pt, view, false)?;
             }
-            let _ = sh;
         }
         Ok(())
     }
@@ -619,12 +1011,12 @@ impl Exporter<'_> {
         Ok(())
     }
 
-    fn links(&self, i: usize, b: Rect, page_of: &HashMap<usize, usize>) -> Vec<Annotation> {
+    fn links_from(&self, i: usize, b: Rect, page_of: &HashMap<usize, usize>, placed: &Placed) -> Vec<Annotation> {
         let pres = self.pres;
         let k = b.width() / pres.slide_size.width.max(1.0);
         let view = Affine::translate((b.x0, b.y0)) * Affine::scale(k);
         let mut out = Vec::new();
-        for l in deckcraft_render::place_slide(pres, i).links {
+        for l in &placed.links {
             let r = view.transform_rect_bbox(l.rect).intersect(b);
             let Some(rect) = krilla::geom::Rect::from_ltrb(r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32) else { continue };
             let goto = |slide: Option<usize>| {
