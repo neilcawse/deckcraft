@@ -21,6 +21,8 @@ craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92
 craft-drawingml = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
 # PresentationML PPTX/POTX/PPSX reader and writer (craft-libs#778).
 craft-pptx = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
+# Bounded, depth- and colour-preserving raster codecs (PNG, JPEG/CMYK/YCCK, TIFF/Lab/BigTIFF, WebP, GIF, BMP).
+craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "=0.1.0" }
 # Shared MCP stdio framing and protocol constants (craft-libs#778).
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "bc186ca719958fcce3b6ee24794277eabed14609", version = "0.1.0" }
 # internal

@@ -4687,6 +4687,47 @@ fn artistic_effects_apply_change_remove_and_round_trip() {
 }
 
 #[test]
+fn artistic_reset_preserves_display_png_when_wdp_original_is_undecodable() {
+    use deckcraft_model::ShapeKind;
+    use deckcraft_model::style::Artistic;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(12, 12, image::Rgba([40, 160, 80, 255])))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let mut s = Session::with_new();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.execute("insert.picture", &json!({"name": "baked.png", "data": cmd::base64_encode(&png)})).unwrap();
+    let (shape_id, display_id, wdp_id) = s
+        .edit(|doc, sel| {
+            let wdp_id = doc.add_media("hdphoto1.wdp", "image/vnd.ms-photo", b"II\xbc\x01\x08\x00\x00\x00".to_vec()).unwrap();
+            let list = crate::shapes_mut(doc, sel).unwrap();
+            let sh = &mut list[0];
+            let display_id = match &mut sh.kind {
+                ShapeKind::Picture { fill } => {
+                    fill.artistic = Some(Artistic { effect: "artisticPaintBrush".into(), original: wdp_id, svg_media: None });
+                    fill.crop = [0.1, 0.0, 0.0, 0.0];
+                    fill.media
+                }
+                other => panic!("{other:?}"),
+            };
+            Ok((sh.id, display_id, wdp_id))
+        })
+        .unwrap();
+    assert_ne!(display_id, wdp_id);
+    // Clearing artisticEffect refuses instead of swapping in the undecodable .wdp original.
+    assert!(s.execute("picture.artisticEffect", &json!({"ids": [shape_id], "effect": "none"})).is_err());
+    // picture.reset still resets crop/adjustments while keeping the decodable baked PNG intact.
+    s.execute("picture.reset", &json!({"ids": [shape_id]})).unwrap();
+    let fill = match &s.doc().unwrap().shape(shape_id).unwrap().kind {
+        ShapeKind::Picture { fill } => fill.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(fill.media, display_id);
+    assert_eq!(fill.crop, [0.0; 4]);
+    assert_eq!(fill.artistic.as_ref().map(|a| a.original), Some(wdp_id));
+}
+
+#[test]
 fn handout_master_view_edits_and_round_trips() {
     use deckcraft_model::PhType;
     let mut s = Session::with_new();
